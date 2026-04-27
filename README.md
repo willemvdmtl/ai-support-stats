@@ -1,78 +1,149 @@
-# AI Support Stats Rebuild
+# Support Stats
 
-This rebuild is focused on deterministic, reusable script-based workflows with minimal LLM logic.
+This workflow extracts data from GitHub and Jira to generate visualisations and produce insights on PRs.
 
-## Setup
-1. Dependency checks
-2. GitHub auth validation via `gh` (keychain-backed)
-3. Jira auth validation using credentials stored via Python `keyring`
-4. Team owner configuration prompt
-5. Deterministic discovery of owner-tagged repositories from `catalog-info.yaml`
+## Quick Start (Recommended)
 
-## Script
-
-- `scripts/setup.py`
-
-## Run
+Use the full workflow entrypoint:
 
 ```bash
-python3 scripts/setup.py
+python3 scripts/run-workflow.py
+python3 scripts/run-workflow.py --month 2026-04
 ```
 
-Optional non-interactive arguments:
-
-```bash
-python3 scripts/setup.py --org trainline-private --owner ecommerce
-```
+This runs setup, fetches GitHub and Jira data, generates charts, and writes a markdown report.
 
 ## Requirements
 
+Some dependencies can be detected and guided by the scripts, but a few account-specific values must be provided by the user.
+
+Technical dependencies:
+
 - Python 3.9+
-- `gh` CLI installed and authenticated
+- GitHub CLI (`gh`) installed
+- `gh` authenticated to the right org
 - Python `keyring` package
 
-If `gh` is missing and Homebrew is installed:
+Install examples:
 
 ```bash
 brew install gh
-```
-
-If Homebrew is not installed:
-
-- Install Homebrew: https://brew.sh
-- Or install GitHub CLI directly: https://cli.github.com
-
-If `keyring` is missing:
-
-```bash
 python3 -m pip install keyring
+gh auth login
 ```
 
-`keyring` uses the native credential backend for your OS when available, such as macOS Keychain or Windows Credential Manager.
+## Required User Inputs By Capability
 
-## Jira Credential Storage
+Setup is capability-based. The workflow runs all capabilities by default.
 
-The script stores Jira credentials under the `keyring` service:
+### Capability 1: GitHub minimal (repo discovery)
 
-- `ai-support-stats.jira`
+User must provide:
 
-Using these usernames:
+- GitHub org (for example `trainline-private`)
+- Owner slug from `catalog-info.yaml` (`spec.owner`), for example `ecommerce`
 
-- `ai-support-stats.jira.site` (example value: `trainline.atlassian.net`)
-- `ai-support-stats.jira.email`
-- `ai-support-stats.jira.api-token`
+Used for:
 
-On first run, `scripts/setup.py` will prompt for any missing Jira credentials and store them automatically via `keyring`.
+- Discovering owned repositories for PR data collection
 
-Create Jira API token at:
+### Capability 2: GitHub internal team
+
+User must provide:
+
+- Comma-separated GitHub usernames for internal team members
+
+Used for:
+
+- Internal vs external PR split chart
+
+### Capability 3: Jira minimal
+
+User must provide:
+
+- Jira site (defaults to `trainline.atlassian.net`)
+- Jira email
+- Jira project key (for example `ECOM`)
+- Jira issue types (default prompt includes `PR Request,ExternalRequest`)
+- Jira API token generated specifically for this workflow
+
+Token creation link:
 
 - https://id.atlassian.com/manage-profile/security/api-tokens
 
+Notes:
+
+- Credentials are stored via `keyring` (native OS credential store).
+- If stored Jira credentials fail auth, setup clears them and re-prompts.
+
+### Capability 4: Jira org structure (enhanced team heatmap)
+
+User may need to provide (defaults are prefilled):
+
+- Source repo owner/name/path/ref for org structure JSON
+- Optional Jira requesting-team field IDs
+
+Used for:
+
+- Team normalization and requesting-team heatmap enrichment
+
+## Main Commands
+
+Full workflow (preferred):
+
+```bash
+python3 scripts/run-workflow.py --month 2026-04
+python3 scripts/run-workflow.py --skip-setup --month 2026-04
+```
+
+Setup only:
+
+```bash
+python3 scripts/setup.py
+python3 scripts/setup.py --list
+python3 scripts/setup.py --capabilities 1,2,3,4
+```
+
+Fetch only:
+
+```bash
+python3 scripts/fetch-data.py github --month 2026-04
+python3 scripts/fetch-data.py jira --month 2026-04
+```
+
+Generate only:
+
+```bash
+python3 scripts/generate-charts.py --month 2026-04
+python3 scripts/generate-report.py --month 2026-04
+```
+
+Clean generated data:
+
+```bash
+python3 scripts/clean.py --cache
+python3 scripts/clean.py --config
+python3 scripts/clean.py --all
+```
+
 ## Outputs
 
-- `data/github/owned-repositories.json`
+- `config/owned-repositories.json`
+- `config/github-minimal.json`
+- `config/github-internal-team.json`
+- `config/jira-minimal.json`
+- `config/jira-org-structure.json`
+- `config/capabilities.json`
+- `cache/github/prs-YYYY-MM.json`
+- `cache/jira/tickets-YYYY-MM.json`
+- `cache/jira/derived/tickets-YYYY-MM.normalized.json`
+- `reports/github_pr_heatmap_YYYY_MM.png`
+- `reports/github_pr_internal_external_YYYY_MM.png`
+- `reports/jira_service_heatmap_YYYY_MM.png`
+- `reports/jira_requesting_team_heatmap_YYYY_MM.png`
+- `reports/report_YYYY_MM.md`
 
-If the discovered list is wrong:
+## Notes
 
-1. Edit `data/github/owned-repositories.json` directly (local override)
-2. Or fix the `spec.owner` value in repository `catalog-info.yaml` files and re-run setup
+- Hand-maintained files such as `config/jira-team-normalization.json` and `config/jira-team-overrides.json` are intentionally not removed by config clean.
+- Existing `data/config/*` files are still read as fallback for migration compatibility.

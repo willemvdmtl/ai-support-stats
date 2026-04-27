@@ -1,0 +1,7 @@
+cache
+config
+reports
+.vscode
+.venv
+!config/jira-team-normalization.json
+!config/jira-team-overrides.json
