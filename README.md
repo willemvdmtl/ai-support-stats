@@ -2,6 +2,16 @@
 
 This workflow extracts data from GitHub and Jira to generate visualisations and produce insights on PRs.
 
+## Sample Charts
+
+### PR Heatmap
+
+![Sample PR heatmap](reports/sample_chart_github_prs.png)
+
+### Internal vs External PRs
+
+![Sample internal vs external PR chart](reports/sample_chart_github_external_internal.png)
+
 ## Quick Start (Recommended)
 
 Use the full workflow entrypoint:
