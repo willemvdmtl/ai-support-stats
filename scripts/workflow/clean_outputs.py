@@ -22,6 +22,7 @@ CONFIG_TARGETS: List[str] = [
     "config/github-internal-team.json",
     "config/jira-minimal.json",
     "config/jira-org-structure.json",
+    "config/jira-service-normalization.json",
     "data/config",
 ]
 

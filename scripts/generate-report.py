@@ -4,7 +4,6 @@
 import argparse
 import datetime as dt
 import os
-import statistics
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -55,36 +54,44 @@ def parse_jira_datetime(raw: str) -> Optional[dt.datetime]:
     return None
 
 
-def jira_cycle_time_days(year: int, month: int) -> Optional[float]:
+def jira_cycle_stats(year: int, month: int) -> Tuple[Optional[float], Optional[Dict[str, object]]]:
     path = jira_consolidated_file(year, month)
     if not os.path.exists(path):
-        return None
+        return None, None
 
     payload = read_json(path)
     tickets: List[Dict] = payload.get("tickets", [])
     if not tickets:
-        return None
+        return None, None
 
     durations_days: List[float] = []
+    longest_wait: Optional[Dict[str, object]] = None
 
     for ticket in tickets:
         fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
         created = parse_jira_datetime(str(fields.get("created") or ""))
-        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
-        if created is None or resolution is None:
+        if created is None:
             continue
 
-        delta = (resolution - created).total_seconds()
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        end = resolution or dt.datetime.now(created.tzinfo)
+        delta = (end - created).total_seconds()
         if delta < 0:
             continue
-        durations_days.append(delta / 86400.0)
 
-    if not durations_days:
-        return None
+        wait_days = delta / 86400.0
+        if resolution is not None:
+            durations_days.append(wait_days)
 
-    # One stable headline metric: median cycle time for resolved tickets.
-    median_days = statistics.median(durations_days)
-    return median_days
+        if longest_wait is None or wait_days > float(longest_wait["days"]):
+            longest_wait = {
+                "key": ticket.get("key", ""),
+                "days": wait_days,
+                "status": "resolved" if resolution is not None else "open",
+            }
+
+    average_days = (sum(durations_days) / len(durations_days)) if durations_days else None
+    return average_days, longest_wait
 
 
 def image_block(path: str, alt_text: str, report_dir: str) -> str:
@@ -98,19 +105,28 @@ def build_report(year: int, month: int, report_dir: str) -> str:
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     charts = chart_files(year, month)
 
-    cycle_time = jira_cycle_time_days(year, month)
+    cycle_time, longest_wait = jira_cycle_stats(year, month)
 
     if cycle_time is None:
-        cycle_stat_line = "**Cycle Time (median):** unavailable (no Jira ticket data with resolution timestamps)"
+        cycle_stat_line = "**Cycle Time (average):** unavailable (no Jira ticket data with resolution timestamps)"
     else:
-        cycle_stat_line = (
-            f"**Cycle Time (median):** {cycle_time:.2f} days"
+        cycle_stat_line = f"**Cycle Time (average):** {cycle_time:.2f} days"
+
+    if longest_wait is None:
+        longest_wait_line = "**Longest Wait:** unavailable"
+    else:
+        longest_wait_line = (
+            "**Longest Wait:** "
+            f"{float(longest_wait['days']):.2f} days "
+            f"({longest_wait['key']}, {longest_wait['status']})"
         )
 
     lines = [
         f"# Support Stats - {month_label}",
         "",
         cycle_stat_line,
+        "",
+        longest_wait_line,
         "",
         "## GitHub Charts",
         "",

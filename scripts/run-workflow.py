@@ -3,10 +3,20 @@
 
 import argparse
 import datetime as dt
+import json
 import os
 import subprocess
 import sys
-from typing import List
+from typing import Dict, List
+
+
+CAPABILITY_ID_TO_KEY: Dict[str, str] = {
+    "1": "github_minimal",
+    "2": "github_internal_team",
+    "3": "jira_minimal",
+    "4": "jira_org_structure",
+        "5": "jira_service_normalization",
+}
 
 
 def run_step(label: str, cmd: List[str]) -> None:
@@ -50,6 +60,47 @@ def resolve_with_legacy(path: str, legacy: str) -> str:
     return path
 
 
+def read_json(path: str) -> Dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_capability_ids(raw: str) -> List[str]:
+    normalized = raw.strip().lower()
+    if not normalized or normalized == "all":
+        return list(CAPABILITY_ID_TO_KEY.keys())
+
+    selected: List[str] = []
+    seen = set()
+    for token in (item.strip() for item in raw.split(",")):
+        if not token:
+            continue
+        if token not in CAPABILITY_ID_TO_KEY:
+            print(f"ERROR: Unknown setup capability '{token}'.")
+            print("Valid options: " + ", ".join(CAPABILITY_ID_TO_KEY))
+            sys.exit(1)
+        if token not in seen:
+            selected.append(token)
+            seen.add(token)
+    if not selected:
+        return list(CAPABILITY_ID_TO_KEY.keys())
+    return selected
+
+
+def capability_is_configured(capability_key: str, payload: Dict) -> bool:
+    capabilities = payload.get("capabilities") or {}
+    entry = capabilities.get(capability_key) or {}
+    return bool(entry.get("configured"))
+
+
+def pending_setup_capabilities(raw: str, capabilities_path: str = "config/capabilities.json") -> List[str]:
+    selected = parse_capability_ids(raw)
+    payload = read_json(capabilities_path)
+    return [cap_id for cap_id in selected if not capability_is_configured(CAPABILITY_ID_TO_KEY[cap_id], payload)]
+
+
 def preflight_checks(args: argparse.Namespace, scripts_dir: str, month_key: str) -> None:
     """Fail fast with actionable guidance when required inputs are missing."""
     will_setup = not args.skip_setup
@@ -89,18 +140,28 @@ def main() -> None:
     parser.add_argument("--skip-fetch", action="store_true", help="Skip fetch step")
     parser.add_argument("--skip-generate", action="store_true", help="Skip chart generation step")
     parser.add_argument("--force-fetch", action="store_true", help="Pass --force to fetch step")
-    parser.add_argument("--setup-capabilities", default="1,2,3,4", help="Capabilities to run in setup step")
+    parser.add_argument("--setup-capabilities", default="1,2,3,4,5", help="Capabilities to run in setup step")
     args = parser.parse_args()
 
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     py = sys.executable
     month_key = parse_month(args.month)
+    setup_capabilities = pending_setup_capabilities(args.setup_capabilities)
 
     preflight_checks(args, scripts_dir, month_key)
 
     if not args.skip_setup:
-        setup_cmd = [py, os.path.join(scripts_dir, "setup.py"), "--capabilities", args.setup_capabilities]
-        run_step("Setup", setup_cmd)
+        if setup_capabilities:
+            setup_cmd = [
+                py,
+                os.path.join(scripts_dir, "setup.py"),
+                "--capabilities",
+                ",".join(setup_capabilities),
+            ]
+            run_step("Setup", setup_cmd)
+        else:
+            print("\n=== Setup ===")
+            print("All selected setup capabilities are already configured. Skipping setup.")
 
     if not args.skip_fetch:
         fetch_cmd = [py, os.path.join(scripts_dir, "fetch-data.py"), "github", "--month", month_key]

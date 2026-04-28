@@ -29,6 +29,11 @@ CAPABILITIES: List[Dict[str, str]] = [
         "name": "Jira org structure (areas/teams for team heatmap)",
         "script": os.path.join("setup", "jira_org_structure.py"),
     },
+    {
+        "id": "5",
+        "name": "Jira service normalization (service name aliases seeded from owned repos)",
+        "script": os.path.join("setup", "jira_service_normalization.py"),
+    },
 ]
 
 
@@ -107,6 +112,12 @@ def build_capability_args(capability_id: str, args: argparse.Namespace) -> List[
             forwarded.extend(["--team-normalization-output", args.jira_team_norm_output.strip()])
         if args.jira_requesting_team_fields.strip():
             forwarded.extend(["--requesting-team-fields", args.jira_requesting_team_fields.strip()])
+
+    if capability_id == "5":
+        if args.service_norm_repos_input.strip():
+            forwarded.extend(["--repos-input", args.service_norm_repos_input.strip()])
+        if args.service_norm_output.strip():
+            forwarded.extend(["--output", args.service_norm_output.strip()])
 
     return forwarded
 
@@ -216,6 +227,16 @@ def main() -> None:
         "--jira-requesting-team-fields",
         default="",
         help="Comma-separated Jira field IDs used to read requesting team values for capability 4",
+    )
+    parser.add_argument(
+        "--service-norm-repos-input",
+        default="",
+        help="Override owned repositories input file for capability 5",
+    )
+    parser.add_argument(
+        "--service-norm-output",
+        default="",
+        help="Override service normalization output file for capability 5",
     )
     args = parser.parse_args()
 

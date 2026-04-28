@@ -11,14 +11,15 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from common.palette import build_colormap
-from common.setup_utils import read_json, write_json
+from common.setup_utils import read_json
 
 REPORTS_DIR = "reports"
 CONSOLIDATED_DIR = "cache/jira"
-DERIVED_DIR = "cache/jira/derived"
 TEAM_NORMALIZATION_FILE = "config/jira-team-normalization.json"
 ORG_STRUCTURE_FILE = "config/jira-org-structure.json"
 OVERRIDES_FILE = "config/jira-team-overrides.json"
+SERVICE_NORMALIZATION_FILE = "config/jira-service-normalization.json"
+SERVICE_OVERRIDES_FILE = "config/jira-service-overrides.json"
 DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
     ("customfield_16011", "Service Name"),
 ]
@@ -26,10 +27,6 @@ DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
 
 def consolidated_file(year: int, month: int) -> str:
     return os.path.join(CONSOLIDATED_DIR, f"tickets-{year}-{month:02d}.json")
-
-
-def derived_file(year: int, month: int) -> str:
-    return os.path.join(DERIVED_DIR, f"tickets-{year}-{month:02d}.normalized.json")
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -204,21 +201,76 @@ def _team_alias_map(team_config: Dict) -> Dict[str, str]:
     return normalized
 
 
+def _compose_team_display(parent_name: str, team_name: str) -> str:
+    parent = str(parent_name or "").strip()
+    team = str(team_name or "").strip()
+    if parent and team:
+        return f"{parent} - {team}"
+    return team or parent
+
+
 def _org_team_map(org_config: Dict) -> Dict[str, Dict[str, str]]:
-    teams = org_config.get("teams") or {}
     mapped: Dict[str, Dict[str, str]] = {}
+
+    # Prefer detailed area records because they include sub-area information
+    # needed to build the legacy-style "Parent - Team" normalized format.
+    for area in org_config.get("areas", []):
+        if not isinstance(area, dict):
+            continue
+        area_name = str(area.get("area_name") or "").strip()
+        teams = area.get("teams") or []
+        if not isinstance(teams, list):
+            continue
+        for team in teams:
+            if not isinstance(team, dict):
+                continue
+            if team.get("retired"):
+                continue
+            canonical_name = str(team.get("team_name") or "").strip()
+            if not canonical_name:
+                continue
+            sub_area_name = str(team.get("sub_area_name") or "").strip()
+            parent_name = sub_area_name or area_name
+            mapped[canonical_name] = {
+                "display_name": _compose_team_display(parent_name, canonical_name),
+                "area": area_name,
+                "parent": parent_name,
+            }
+
+    teams = org_config.get("teams") or {}
     if not isinstance(teams, dict):
         return mapped
+
     for canonical, details in teams.items():
         canonical_name = str(canonical).strip()
         if not canonical_name:
             continue
+        if canonical_name in mapped:
+            continue
         if isinstance(details, str):
-            mapped[canonical_name] = {"display_name": canonical_name, "area": details.strip()}
-        elif isinstance(details, dict):
+            area_name = details.strip()
             mapped[canonical_name] = {
-                "display_name": str(details.get("display_name") or canonical_name).strip(),
-                "area": str(details.get("area") or "").strip(),
+                "display_name": _compose_team_display(area_name, canonical_name),
+                "area": area_name,
+                "parent": area_name,
+            }
+        elif isinstance(details, dict):
+            area_name = str(details.get("area") or "").strip()
+            parent_name = str(
+                details.get("sub_area")
+                or details.get("subArea")
+                or details.get("parent")
+                or area_name
+                or ""
+            ).strip()
+            mapped[canonical_name] = {
+                "display_name": str(
+                    details.get("display_name")
+                    or _compose_team_display(parent_name, canonical_name)
+                    or canonical_name
+                ).strip(),
+                "area": area_name,
+                "parent": parent_name,
             }
     return mapped
 
@@ -235,6 +287,68 @@ def _load_overrides() -> Dict[str, str]:
         if norm and canonical:
             result[norm] = canonical
     return result
+
+
+
+def _load_service_overrides() -> Dict[str, str]:
+    """Load manually curated raw-value → canonical-service overrides."""
+    raw = _read_optional_json(SERVICE_OVERRIDES_FILE)
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for k, v in raw.items():
+        norm = str(k).strip().lower()
+        canonical = str(v).strip()
+        if norm and canonical:
+            result[norm] = canonical
+    return result
+
+
+def _service_alias_map() -> Tuple[Dict[str, str], List[str]]:
+    """
+    Return (alias_map, canonical_names) from the generated service normalization file.
+
+    alias_map: lowercase raw value → canonical service name
+    canonical_names: list of known canonical service names (for exact-match tier)
+    """
+    data = _read_optional_json(SERVICE_NORMALIZATION_FILE)
+    if not isinstance(data, dict):
+        return {}, []
+    aliases: Dict[str, str] = {}
+    for k, v in (data.get("service_aliases") or {}).items():
+        norm = str(k).strip().lower()
+        canonical = str(v).strip()
+        if norm and canonical:
+            aliases[norm] = canonical
+    canonical_names: List[str] = [str(n).strip() for n in (data.get("canonical_services") or []) if str(n).strip()]
+    return aliases, canonical_names
+
+
+def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[str, str], canonical_names: List[str]) -> str:
+    """
+    Resolve a raw service field value to its canonical form.
+
+    Tiers:
+    1. Curated overrides (jira-service-overrides.json) — exact, case-insensitive
+    2. Generated alias map (jira-service-normalization.json -> service_aliases)
+    3. Exact case-insensitive match against known canonical names
+    4. Raw value fallback
+    """
+    key = raw.strip().lower()
+    if not key:
+        return raw
+
+    if key in overrides:
+        return overrides[key]
+
+    if key in aliases:
+        return aliases[key]
+
+    for name in canonical_names:
+        if key == name.lower():
+            return name
+
+    return raw.strip()
 
 
 def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dict:
@@ -303,7 +417,12 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
                     break
 
         area = org_teams.get(canonical_team, {}).get("area", "") if canonical_team else ""
-        effective_team = canonical_team or (deduped_values[0] if deduped_values else "")
+        normalized_display = org_teams.get(canonical_team, {}).get("display_name", "") if canonical_team else ""
+        if canonical_team and not normalized_display:
+            normalized_display = canonical_team
+
+        raw_primary = deduped_values[0] if deduped_values else ""
+        effective_team = normalized_display or raw_primary
         team_source = "mapped" if canonical_team else ("raw" if deduped_values else "missing")
         status = "mapped" if canonical_team else ("unmapped" if deduped_values else "missing")
         if canonical_team:
@@ -323,7 +442,7 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
                 "created_at": fields.get("created", ""),
                 "components": ticket_components(ticket),
                 "requesting_team_raw": deduped_values,
-                "requesting_team": canonical_team,
+                "requesting_team": normalized_display,
                 "requesting_team_match_method": match_method or (team_source),
                 "requesting_team_effective": effective_team,
                 "requesting_team_source": team_source,
@@ -350,8 +469,6 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
         "tickets": normalized_tickets,
     }
 
-    os.makedirs(DERIVED_DIR, exist_ok=True)
-    write_json(derived_file(year, month), payload)
     return payload
 
 
@@ -371,6 +488,9 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
         if dt.date(year, month, d).weekday() >= 5
     }
 
+    svc_overrides = _load_service_overrides()
+    svc_aliases, svc_canonical = _service_alias_map()
+
     component_day: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
     component_total: Dict[str, int] = defaultdict(int)
     source_label_count: Dict[str, int] = defaultdict(int)
@@ -382,8 +502,9 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
         groups, source_label = ticket_basic_groups(ticket, DEFAULT_BASIC_GROUP_FIELDS)
         source_label_count[source_label] += 1
         for component in groups:
-            component_day[component][day] += 1
-            component_total[component] += 1
+            normalized = normalize_service_name(component, svc_overrides, svc_aliases, svc_canonical)
+            component_day[normalized][day] += 1
+            component_total[normalized] += 1
 
     if not component_total:
         print(f"  No Jira tickets found for {month_name}. Skipping component heatmap.")
@@ -702,7 +823,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"Loaded {len(tickets)} ticket(s)")
 
     derived_payload = derive_normalized_tickets(tickets, year, month)
-    print(f"Wrote derived ticket file: {derived_file(year, month)}")
 
     do_service = not args.team_only
     do_team = not args.service_only
