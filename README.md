@@ -1,6 +1,7 @@
 # Support Stats
 
-This workflow extracts data from GitHub and Jira to generate visualisations and produce insights on PRs.
+This workflow extracts data from GitHub and Jira to generate visualisations and produce insights on PRs.  
+Recommended: prepare required [user inputs](#capability-1-github-minimal-repo-discovery) for each capability beforehand
 
 ## Sample Charts
 
