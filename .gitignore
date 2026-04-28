@@ -5,3 +5,5 @@ reports
 .venv
 !config/jira-team-normalization.json
 !config/jira-team-overrides.json
+!reports/sample_chart_github_prs.png
+!reports/sample_chart_github_external_internal.png

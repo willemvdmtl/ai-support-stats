@@ -127,6 +127,8 @@ def _read_optional_json(path: str) -> Dict:
 
 _SEGMENT_SEP_RE = re.compile(r'\s+-\s+|\s+[\u2013\u2014]\s+')
 _NORM_NONALNUM_RE = re.compile(r'[^a-z0-9 ]')
+_SERVICE_NONALNUM_RE = re.compile(r'[^a-z0-9]')
+_SERVICE_SUFFIX_RE = re.compile(r'(service|api|contract|domain)$')
 
 
 def _norm_key(s: str) -> str:
@@ -135,6 +137,14 @@ def _norm_key(s: str) -> str:
     s = s.replace('&', 'and').replace('-', ' ').replace('_', ' ')
     s = _NORM_NONALNUM_RE.sub('', s)
     return re.sub(r'\s+', ' ', s).strip()
+
+
+def _compact_service_key(s: str) -> str:
+    return _SERVICE_NONALNUM_RE.sub('', str(s).strip().lower())
+
+
+def _strip_service_suffix(s: str) -> str:
+    return _SERVICE_SUFFIX_RE.sub('', s)
 
 
 def _build_structural_index(org_config: Dict) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
@@ -346,6 +356,25 @@ def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[st
 
     for name in canonical_names:
         if key == name.lower():
+            return name
+
+    # Fuzzy fallback for punctuation/case/spacing variants.
+    compact = _compact_service_key(key)
+    if not compact:
+        return raw.strip()
+
+    # Match alias keys after compacting both sides.
+    for alias_key, canonical in aliases.items():
+        if compact == _compact_service_key(alias_key):
+            return canonical
+
+    # Match canonical names after compacting; allow optional common suffix removal.
+    compact_stem = _strip_service_suffix(compact)
+    for name in canonical_names:
+        canonical_compact = _compact_service_key(name)
+        if compact == canonical_compact:
+            return name
+        if compact_stem and compact_stem == _strip_service_suffix(canonical_compact):
             return name
 
     return raw.strip()
