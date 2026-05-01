@@ -4,6 +4,7 @@
 import base64
 import datetime as dt
 import getpass
+import importlib.util
 import json
 import os
 import shutil
@@ -64,6 +65,57 @@ def check_dependencies(require_gh: bool = False, require_keyring: bool = False) 
         for item in missing:
             print(f"  - {item}")
         print_dependency_guidance(missing)
+        sys.exit(1)
+
+
+def _parse_requirement_name(line: str) -> str:
+    cleaned = line.split("#", 1)[0].strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("-r") or cleaned.startswith("--"):
+        return ""
+    if ";" in cleaned:
+        cleaned = cleaned.split(";", 1)[0].strip()
+
+    for operator in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+        if operator in cleaned:
+            cleaned = cleaned.split(operator, 1)[0].strip()
+            break
+
+    if "[" in cleaned:
+        cleaned = cleaned.split("[", 1)[0].strip()
+
+    return cleaned
+
+
+def check_python_requirements(requirements_path: str) -> None:
+    if not os.path.exists(requirements_path):
+        print("ERROR: Missing Python requirements file:")
+        print(f"  {requirements_path}")
+        print("Fix: Restore requirements.txt and rerun setup.")
+        sys.exit(1)
+
+    with open(requirements_path, "r", encoding="utf-8") as req_file:
+        package_names = [
+            _parse_requirement_name(line)
+            for line in req_file.readlines()
+        ]
+
+    package_names = [name for name in package_names if name]
+
+    missing_packages: List[str] = []
+    for package_name in package_names:
+        module_name = package_name.replace("-", "_")
+        if importlib.util.find_spec(module_name) is None:
+            missing_packages.append(package_name)
+
+    if missing_packages:
+        rel_requirements = os.path.basename(requirements_path)
+        print("ERROR: Missing required Python packages:")
+        for package_name in missing_packages:
+            print(f"  - {package_name}")
+        print("Install them with:")
+        print(f"  {sys.executable} -m pip install -r {rel_requirements}")
         sys.exit(1)
 
 

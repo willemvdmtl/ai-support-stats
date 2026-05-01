@@ -17,7 +17,7 @@ def main() -> None:
         return
     # No subcommand: run both
     github_main(argv)
-    jira_main([])
+    jira_main(argv)
 
 
 if __name__ == "__main__":

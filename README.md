@@ -33,13 +33,13 @@ Technical dependencies:
 - Python 3.9+
 - GitHub CLI (`gh`) installed
 - `gh` authenticated to the right org
-- Python `keyring` package
+- Python packages from `requirements.txt`
 
 Install examples:
 
 ```bash
 brew install gh
-python3 -m pip install keyring
+python3 -m pip install -r requirements.txt
 gh auth login
 ```
 

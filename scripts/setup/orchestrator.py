@@ -7,6 +7,8 @@ import subprocess
 import sys
 from typing import Dict, List
 
+from common.setup_utils import check_python_requirements
+
 
 CAPABILITIES: List[Dict[str, str]] = [
     {
@@ -247,6 +249,8 @@ def main() -> None:
         return
 
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    requirements_path = os.path.join(os.path.dirname(script_dir), "requirements.txt")
+    check_python_requirements(requirements_path)
 
     if args.all:
         selected = CAPABILITIES

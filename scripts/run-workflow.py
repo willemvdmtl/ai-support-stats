@@ -9,6 +9,8 @@ import subprocess
 import sys
 from typing import Dict, List
 
+from common.setup_utils import check_python_requirements
+
 
 CAPABILITY_ID_TO_KEY: Dict[str, str] = {
     "1": "github_minimal",
@@ -144,6 +146,9 @@ def main() -> None:
     args = parser.parse_args()
 
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    requirements_path = os.path.join(os.path.dirname(scripts_dir), "requirements.txt")
+    check_python_requirements(requirements_path)
+
     py = sys.executable
     month_key = parse_month(args.month)
     setup_capabilities = pending_setup_capabilities(args.setup_capabilities)
