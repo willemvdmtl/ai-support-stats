@@ -153,7 +153,11 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="List available setup capabilities")
 
     parser.add_argument("--org", default="", help="GitHub organization for capability 1")
-    parser.add_argument("--owner", default="", help="catalog-info owner value for capability 1")
+    parser.add_argument(
+        "--owner",
+        default="",
+        help="catalog-info owner value(s) for capability 1 (comma-separated)",
+    )
     parser.add_argument("--github-output", default="", help="Override output file for capability 1")
     parser.add_argument(
         "--github-config-output",

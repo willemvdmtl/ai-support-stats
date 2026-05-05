@@ -52,7 +52,7 @@ Setup is capability-based. The workflow runs all capabilities by default.
 User must provide:
 
 - GitHub org (for example `trainline-private`)
-- Owner slug from `catalog-info.yaml` (`spec.owner`), for example `ecommerce`
+- Owner slug(s) from `catalog-info.yaml` (`spec.owner`), comma-separated if multiple, for example `ecommerce,checkout`
 
 Used for:
 

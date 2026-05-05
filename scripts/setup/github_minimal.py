@@ -17,24 +17,30 @@ from common.setup_utils import (
 )
 
 
-def discover_repositories(token: str, org: str, owner: str) -> List[str]:
-    query = f'org:{org} filename:catalog-info.yaml "owner: {owner}"'
-    print(f"Running GitHub code search: {query}")
-    try:
-        items = github_search_code(token, query)
-    except Exception as exc:
-        print(f"ERROR: GitHub discovery call failed: {exc}")
-        sys.exit(1)
+def parse_owner_values(raw: str) -> List[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
+
+def discover_repositories(token: str, org: str, owners: List[str]) -> List[str]:
     by_repo: Dict[str, List[str]] = {}
-    for item in items:
-        repo = (item.get("repository") or {}).get("full_name")
-        path = item.get("path") or "catalog-info.yaml"
-        if not repo:
-            continue
-        by_repo.setdefault(repo, [])
-        if path not in by_repo[repo]:
-            by_repo[repo].append(path)
+
+    for owner in owners:
+        query = f'org:{org} filename:catalog-info.yaml "owner: {owner}"'
+        print(f"Running GitHub code search: {query}")
+        try:
+            items = github_search_code(token, query)
+        except Exception as exc:
+            print(f"ERROR: GitHub discovery call failed for owner '{owner}': {exc}")
+            sys.exit(1)
+
+        for item in items:
+            repo = (item.get("repository") or {}).get("full_name")
+            path = item.get("path") or "catalog-info.yaml"
+            if not repo:
+                continue
+            by_repo.setdefault(repo, [])
+            if path not in by_repo[repo]:
+                by_repo[repo].append(path)
 
     return sorted(by_repo.keys())
 
@@ -68,19 +74,26 @@ def main() -> None:
         "Enter GitHub organization (e.g. trainline-private) [trainline-private]: ",
         default="trainline-private",
     )
-    owner = prompt_if_missing(args.owner.strip(), "Enter exact catalog-info owner value (e.g. ecommerce): ")
+    owner_input = prompt_if_missing(
+        args.owner.strip(),
+        "Enter catalog-info owner value(s), comma-separated (e.g. ecommerce,checkout): ",
+    )
+    owners = parse_owner_values(owner_input)
 
-    if not org or not owner:
-        print("ERROR: org and owner are required.")
+    if not org or not owners:
+        print("ERROR: org and at least one owner value are required.")
         sys.exit(1)
 
-    repositories = discover_repositories(github_token, org, owner)
+    repositories = discover_repositories(github_token, org, owners)
+    search_queries = [f'org:{org} filename:catalog-info.yaml "owner: {owner}"' for owner in owners]
 
     output_payload = {
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "organization": org,
-        "owner_value": owner,
-        "search_query": f'org:{org} filename:catalog-info.yaml "owner: {owner}"',
+        "owner_values": owners,
+        "owner_value": ",".join(owners),
+        "search_queries": search_queries,
+        "search_query": " OR ".join(search_queries),
         "repositories": repositories,
     }
     write_json(args.output, output_payload)
@@ -88,7 +101,8 @@ def main() -> None:
     config_payload = {
         "configured_at": dt.datetime.utcnow().isoformat() + "Z",
         "organization": org,
-        "owner_value": owner,
+        "owner_values": owners,
+        "owner_value": ",".join(owners),
         "owned_repositories_file": args.output,
     }
     write_json(args.config_output, config_payload)
@@ -98,7 +112,7 @@ def main() -> None:
         True,
         {
             "organization": org,
-            "owner_value": owner,
+            "owner_values": owners,
             "repositories_found": len(repositories),
             "config_file": args.config_output,
         },
