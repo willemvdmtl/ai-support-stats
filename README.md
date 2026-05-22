@@ -75,7 +75,8 @@ User must provide:
 - Jira site (defaults to `trainline.atlassian.net`)
 - Jira email
 - Jira project key (for example `ECOM`)
-- Jira issue types (default prompt includes `PR Request,ExternalRequest`)
+- Vertical Support issue types (default prompt includes `PR Request,ExternalRequest`)
+- Optional Vertical Support Jira labels/tags (for example `vertical support`)
 - Jira API token generated specifically for this workflow
 
 Token creation link:
@@ -133,8 +134,10 @@ Clean generated data:
 
 ```bash
 python3 scripts/clean.py --cache
+python3 scripts/clean.py --reports
 python3 scripts/clean.py --config
-python3 scripts/clean.py --all
+python3 scripts/clean.py --cache --reports --archive --yes
+python3 scripts/clean.py --all --archive --yes
 ```
 
 ## Outputs
@@ -144,17 +147,20 @@ python3 scripts/clean.py --all
 - `config/github-internal-team.json`
 - `config/jira-minimal.json`
 - `config/jira-org-structure.json`
+- `config/jira-metric-groups.json`
 - `config/capabilities.json`
 - `cache/github/prs-YYYY-MM.json`
-- `cache/jira/tickets-YYYY-MM.json`
-- `cache/jira/derived/tickets-YYYY-MM.normalized.json`
+- `cache/jira/issues-YYYY-MM.json`
 - `reports/github_pr_heatmap_YYYY_MM.png`
 - `reports/github_pr_internal_external_YYYY_MM.png`
 - `reports/jira_service_heatmap_YYYY_MM.png`
 - `reports/jira_requesting_team_heatmap_YYYY_MM.png`
 - `reports/report_YYYY_MM.md`
+- `archives/pre-clean/YYYYMMDDTHHMMSSZ/`
 
 ## Notes
 
 - Hand-maintained files such as `config/jira-team-normalization.json` and `config/jira-team-overrides.json` are intentionally not removed by config clean.
 - Existing `data/config/*` files are still read as fallback for migration compatibility.
+- Jira fetch always pulls all issues for the configured project/month window. Vertical Support is defined in `config/jira-minimal.json` and can be filtered by issue type and/or Jira labels (tags) during processing.
+- Cycle-time grouping and deterministic window/validity rules are configured in `config/jira-metric-groups.json`.

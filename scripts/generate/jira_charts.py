@@ -4,6 +4,7 @@
 import argparse
 import calendar
 import datetime as dt
+import json
 import os
 import re
 import sys
@@ -20,13 +21,14 @@ ORG_STRUCTURE_FILE = "config/jira-org-structure.json"
 OVERRIDES_FILE = "config/jira-team-overrides.json"
 SERVICE_NORMALIZATION_FILE = "config/jira-service-normalization.json"
 SERVICE_OVERRIDES_FILE = "config/jira-service-overrides.json"
+JIRA_CONFIG_FILE = "config/jira-minimal.json"
 DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
     ("customfield_16011", "Service Name"),
 ]
 
 
 def consolidated_file(year: int, month: int) -> str:
-    return os.path.join(CONSOLIDATED_DIR, f"tickets-{year}-{month:02d}.json")
+    return os.path.join(CONSOLIDATED_DIR, f"issues-{year}-{month:02d}.json")
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -38,6 +40,46 @@ def parse_month(raw: str) -> Tuple[int, int]:
         sys.exit(1)
 
 
+def load_vertical_support_filters() -> Tuple[set, set]:
+    data = _read_optional_json(JIRA_CONFIG_FILE)
+    vertical = data.get("vertical_support") if isinstance(data, dict) else {}
+    issue_types = []
+    tags = []
+    if isinstance(vertical, dict):
+        issue_types = vertical.get("issue_types") or []
+        tags = vertical.get("tags") or []
+    if not issue_types and isinstance(data, dict):
+        issue_types = data.get("issue_types") or []
+
+    def normalize(values: List[str]) -> set:
+        normalized = set()
+        for raw in values or []:
+            cleaned = str(raw).strip().lower()
+            if cleaned:
+                normalized.add(cleaned)
+        return normalized
+
+    return normalize(issue_types), normalize(tags)
+
+
+def ticket_issue_type(ticket: Dict) -> str:
+    fields = ticket_fields(ticket)
+    issue_type = fields.get("issuetype") if isinstance(fields.get("issuetype"), dict) else {}
+    return str(issue_type.get("name") or "").strip()
+
+
+def ticket_labels(ticket: Dict) -> set:
+    fields = ticket_fields(ticket)
+    labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
+    return {str(label).strip().lower() for label in labels if str(label).strip()}
+
+
+def is_vertical_support_ticket(ticket: Dict, issue_types: set, tags: set) -> bool:
+    by_type = bool(issue_types) and ticket_issue_type(ticket).lower() in issue_types
+    by_tag = bool(tags) and bool(ticket_labels(ticket) & tags)
+    return by_type or by_tag
+
+
 def load_tickets(year: int, month: int) -> List[Dict]:
     path = consolidated_file(year, month)
     if not os.path.exists(path):
@@ -45,7 +87,18 @@ def load_tickets(year: int, month: int) -> List[Dict]:
         print(f"Run first:  python3 scripts/fetch-data.py jira --month {year}-{month:02d}")
         sys.exit(1)
     data = read_json(path)
-    return data.get("tickets", [])
+    issues = data.get("issues", [])
+    issue_types, tags = load_vertical_support_filters()
+    selected = issues
+    if issue_types or tags:
+        selected = [ticket for ticket in issues if is_vertical_support_ticket(ticket, issue_types, tags)]
+
+    target_month = f"{year}-{month:02d}"
+    return [
+        ticket
+        for ticket in selected
+        if str(ticket_fields(ticket).get("created") or "").startswith(target_month)
+    ]
 
 
 def ticket_fields(ticket: Dict) -> Dict:
@@ -98,7 +151,38 @@ def ticket_basic_groups(ticket: Dict, field_specs: List[Tuple[str, str]]) -> Tup
         if groups:
             return groups, label
 
+    # Deterministic fallback: infer service from GitHub repo links in the Jira
+    # description when the dedicated service field is empty.
+    desc_repo_groups = ticket_description_repositories(ticket)
+    if desc_repo_groups:
+        return desc_repo_groups, "Description Repo"
+
     return ["Unassigned"], "Unassigned"
+
+
+def ticket_description_repositories(ticket: Dict) -> List[str]:
+    fields = ticket_fields(ticket)
+    description = fields.get("description")
+    if not description:
+        return []
+
+    raw = json.dumps(description)
+    repos = re.findall(r'https?://github\.com/[^/\"]+/([^/\"#?]+)', raw, flags=re.IGNORECASE)
+    if not repos:
+        return []
+
+    deduped: List[str] = []
+    seen = set()
+    for repo in repos:
+        name = str(repo).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
 
 
 def _flatten_values(value: object) -> List[str]:

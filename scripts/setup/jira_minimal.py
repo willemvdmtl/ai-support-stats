@@ -20,6 +20,7 @@ from common.setup_utils import (
 
 
 DEFAULT_OUTPUT = "config/jira-minimal.json"
+DEFAULT_METRIC_GROUPS_OUTPUT = "config/jira-metric-groups.json"
 
 
 def parse_issue_types(raw: str):
@@ -37,6 +38,66 @@ def parse_issue_types(raw: str):
     return values
 
 
+def parse_csv_values(raw: str):
+    values = []
+    seen = set()
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        values.append(value)
+        seen.add(key)
+    return values
+
+
+def build_metric_groups_config(vertical_issue_types, vertical_tags):
+    return {
+        "version": 1,
+        "defaults": {
+            "event_anchor": "resolved_at",
+            "window_policy": {
+                "mode": "auto",
+                "rolling_days_if_month_data_lt_days": 14,
+                "month_window_type_if_ready": "month_to_date",
+            },
+            "validity": {
+                "require_created": True,
+                "require_resolved": True,
+                "exclude_negative_durations": True,
+            },
+        },
+        "groups": [
+            {
+                "id": "vertical_support",
+                "label": "Vertical Support",
+                "filter": {
+                    "include_any": {
+                        "issue_types": vertical_issue_types,
+                        "labels": vertical_tags,
+                    }
+                },
+            },
+            {
+                "id": "ktlo",
+                "label": "KTLO",
+                "filter": {
+                    "exclude_any": {
+                        "issue_types": vertical_issue_types,
+                        "labels": [],
+                    },
+                    "force_include_any": {
+                        "issue_types": [],
+                        "labels": ["ktlo"],
+                    },
+                },
+            },
+        ],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
@@ -44,7 +105,10 @@ def main() -> None:
     parser.add_argument("--jira-email-service", default="ai-support-stats.jira.email")
     parser.add_argument("--jira-token-service", default="ai-support-stats.jira.api-token")
     parser.add_argument("--project", default="")
+    parser.add_argument("--vertical-support-issue-types", default="")
+    parser.add_argument("--vertical-support-tags", default="")
     parser.add_argument("--issue-types", default="")
+    parser.add_argument("--metric-groups-output", default=DEFAULT_METRIC_GROUPS_OUTPUT)
     args = parser.parse_args()
 
     print("Step 1/2: Checking dependencies...")
@@ -90,15 +154,26 @@ def main() -> None:
     print(f"OK: Jira auth works as user: {jira_payload.get('displayName', 'unknown')}")
 
     project = prompt_if_missing(args.project.strip(), "Jira project key [ECOM]: ", default="ECOM")
+    issue_types_input = args.vertical_support_issue_types.strip() or args.issue_types.strip()
     issue_types_raw = prompt_if_missing(
-        args.issue_types.strip(),
-        "Issue types (comma-separated) [PR Request,ExternalRequest]: ",
+        issue_types_input,
+        "Vertical Support issue types (comma-separated) [PR Request,ExternalRequest]: ",
         default="PR Request,ExternalRequest",
     )
+    tags_raw = prompt_if_missing(
+        args.vertical_support_tags.strip(),
+        "Vertical Support tags/labels (comma-separated) [none]: ",
+        default="",
+    )
     issue_types = parse_issue_types(issue_types_raw)
+    tags = parse_csv_values(tags_raw)
 
-    if not project or not issue_types:
-        print("ERROR: project and at least one issue type are required.")
+    if not project:
+        print("ERROR: project is required.")
+        sys.exit(1)
+
+    if not issue_types and not tags:
+        print("ERROR: configure at least one Vertical Support issue type or tag.")
         sys.exit(1)
 
     payload = {
@@ -112,9 +187,17 @@ def main() -> None:
             "api_token": args.jira_token_service,
         },
         "project": project,
+        "vertical_support": {
+            "issue_types": issue_types,
+            "tags": tags,
+        },
+        # Backward compatibility for existing consumers.
         "issue_types": issue_types,
     }
     write_json(args.output, payload)
+
+    metric_groups_payload = build_metric_groups_config(issue_types, tags)
+    write_json(args.metric_groups_output, metric_groups_payload)
 
     update_capability_status(
         "jira_minimal",
@@ -122,13 +205,16 @@ def main() -> None:
         {
             "site": jira_site,
             "project": project,
-            "issue_type_count": len(issue_types),
+            "vertical_support_issue_type_count": len(issue_types),
+            "vertical_support_tag_count": len(tags),
             "config_file": args.output,
+            "metric_groups_file": args.metric_groups_output,
         },
     )
 
     print("\nJira minimal configuration saved.")
     print(f"Output file: {args.output}")
+    print(f"Metric groups file: {args.metric_groups_output}")
 
 
 if __name__ == "__main__":

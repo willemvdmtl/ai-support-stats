@@ -23,7 +23,7 @@ CAPABILITIES: List[Dict[str, str]] = [
     },
     {
         "id": "3",
-        "name": "Jira minimal (PR/ExternalRequest ticket stats)",
+        "name": "Jira minimal (all-issue fetch + Vertical Support filters)",
         "script": os.path.join("setup", "jira_minimal.py"),
     },
     {
@@ -96,8 +96,14 @@ def build_capability_args(capability_id: str, args: argparse.Namespace) -> List[
             forwarded.extend(["--jira-token-service", args.jira_token_service.strip()])
         if args.jira_project.strip():
             forwarded.extend(["--project", args.jira_project.strip()])
-        if args.jira_issue_types.strip():
+        if args.jira_vertical_issue_types.strip():
+            forwarded.extend(["--vertical-support-issue-types", args.jira_vertical_issue_types.strip()])
+        elif args.jira_issue_types.strip():
             forwarded.extend(["--issue-types", args.jira_issue_types.strip()])
+        if args.jira_vertical_tags.strip():
+            forwarded.extend(["--vertical-support-tags", args.jira_vertical_tags.strip()])
+        if args.jira_metric_groups_output.strip():
+            forwarded.extend(["--metric-groups-output", args.jira_metric_groups_output.strip()])
 
     if capability_id == "4":
         if args.org_repo_owner.strip():
@@ -194,9 +200,24 @@ def main() -> None:
     )
     parser.add_argument("--jira-project", default="", help="Jira project key for capability 3")
     parser.add_argument(
+        "--jira-vertical-issue-types",
+        default="",
+        help="Comma-separated Jira issue types that define Vertical Support for capability 3",
+    )
+    parser.add_argument(
+        "--jira-vertical-tags",
+        default="",
+        help="Comma-separated Jira labels/tags that define Vertical Support for capability 3",
+    )
+    parser.add_argument(
         "--jira-issue-types",
         default="",
-        help="Comma-separated Jira issue types for capability 3",
+        help="Deprecated alias for --jira-vertical-issue-types",
+    )
+    parser.add_argument(
+        "--jira-metric-groups-output",
+        default="",
+        help="Override Jira metric group config output file for capability 3",
     )
 
     parser.add_argument(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch Jira tickets for configured issue types with deterministic caching.
+"""Fetch Jira tickets for deterministic Jira caching and derived month files.
 
 Cache layout:
 
@@ -12,8 +12,9 @@ Cache layout:
   cache/jira/manifest.json
       Fetch coverage and sweep history.
 
-  cache/jira/tickets-YYYY-MM.json
-      Derived month ticket file, regenerated from raw + updates.
+  cache/jira/issues-YYYY-MM.json
+      Canonical derived month file containing all Jira issue types.
+      Consumers apply filtering at processing time.
 """
 
 import argparse
@@ -77,7 +78,7 @@ def quote_jql(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
 
 
-def load_jira_runtime(config_file: str) -> Tuple[str, str, str, str, List[str]]:
+def load_jira_config(config_file: str) -> Dict:
     resolved_config_file = config_file
     if not os.path.exists(resolved_config_file) and config_file == CONFIG_FILE:
         legacy = "data/config/jira-minimal.json"
@@ -89,6 +90,11 @@ def load_jira_runtime(config_file: str) -> Tuple[str, str, str, str, List[str]]:
         print(f"ERROR: Could not read Jira config file: {resolved_config_file}")
         print("Run setup first:  python3 scripts/setup.py --capabilities 3")
         sys.exit(1)
+    return config
+
+
+def load_jira_runtime(config_file: str) -> Tuple[str, str, str, str, List[str]]:
+    config = load_jira_config(config_file)
 
     site = (config.get("site") or "").strip()
     email = (config.get("email") or "").strip()
@@ -106,8 +112,6 @@ def load_jira_runtime(config_file: str) -> Tuple[str, str, str, str, List[str]]:
         missing.append("email")
     if not project:
         missing.append("project")
-    if not issue_types:
-        missing.append("issue_types")
     if not api_token:
         missing.append(f"jira api token in keyring username '{token_username}'")
 
@@ -143,25 +147,21 @@ def jira_search(site: str, email: str, api_token: str, jql: str, max_results: in
         return json.loads(response.read().decode("utf-8"))
 
 
-def build_month_jql(project: str, issue_types: List[str], year: int, month: int) -> str:
+def build_month_jql(project: str, year: int, month: int) -> str:
     start, end = month_bounds(year, month)
-    issue_clause = ", ".join(quote_jql(x) for x in issue_types)
     return (
         f"project = {quote_jql(project)} "
-        f"AND issuetype in ({issue_clause}) "
-        f"AND created >= {quote_jql(start)} "
-        f"AND created < {quote_jql(end)} "
-        f"ORDER BY created ASC"
+        f"AND updated >= {quote_jql(start)} "
+        f"AND updated < {quote_jql(end)} "
+        f"ORDER BY updated ASC"
     )
 
 
-def build_updates_jql(project: str, issue_types: List[str], since_iso: str) -> str:
-    issue_clause = ", ".join(quote_jql(x) for x in issue_types)
+def build_updates_jql(project: str, since_iso: str) -> str:
     since_dt = dt.datetime.fromisoformat(since_iso.rstrip("Z"))
     since_jira = since_dt.strftime("%Y-%m-%d %H:%M")
     return (
         f"project = {quote_jql(project)} "
-        f"AND issuetype in ({issue_clause}) "
         f"AND updated >= {quote_jql(since_jira)} "
         f"ORDER BY updated ASC"
     )
@@ -224,7 +224,7 @@ def run_page_file(year: int, month: int, run_id: str, page_index: int) -> str:
 
 
 def consolidated_file(year: int, month: int) -> str:
-    return os.path.join(CONSOLIDATED_DIR, f"tickets-{month_key(year, month)}.json")
+    return os.path.join(CONSOLIDATED_DIR, f"issues-{month_key(year, month)}.json")
 
 
 def issue_key(issue: Dict) -> str:
@@ -237,6 +237,40 @@ def issue_created(issue: Dict) -> str:
 
 def issue_updated(issue: Dict) -> str:
     return (issue.get("fields") or {}).get("updated", "")
+
+
+def issue_type_name(issue: Dict) -> str:
+    fields = issue.get("fields") or {}
+    issue_type = fields.get("issuetype") or {}
+    name = issue_type.get("name") if isinstance(issue_type, dict) else ""
+    return str(name or "").strip()
+
+
+def normalize_issue_types(issue_types: List[str]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for issue_type in issue_types:
+        cleaned = str(issue_type).strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(cleaned)
+    return normalized
+
+
+def load_vertical_support_filters(config: Dict) -> Tuple[List[str], List[str]]:
+    vertical = config.get("vertical_support") if isinstance(config, dict) else {}
+    issue_types = []
+    tags = []
+    if isinstance(vertical, dict):
+        issue_types = normalize_issue_types(vertical.get("issue_types") or [])
+        tags = normalize_issue_types(vertical.get("tags") or [])
+    if not issue_types:
+        issue_types = normalize_issue_types(config.get("issue_types") or [])
+    return issue_types, tags
 
 
 def load_issues_from_run(year: int, month: int, run_id: str) -> Tuple[List[Dict], List[str]]:
@@ -258,9 +292,9 @@ def load_issues_from_run(year: int, month: int, run_id: str) -> Tuple[List[Dict]
     return issues, source_files
 
 
-def issue_month(issue: Dict) -> str:
-    created = issue_created(issue)
-    return created[:7] if len(created) >= 7 else ""
+def issue_updated_month(issue: Dict) -> str:
+    updated = issue_updated(issue)
+    return updated[:7] if len(updated) >= 7 else ""
 
 
 def consolidate_month(year: int, month: int) -> int:
@@ -299,7 +333,7 @@ def consolidate_month(year: int, month: int) -> int:
             pages = update_payload.get("pages", [])
             for page in pages:
                 for issue in page.get("issues", []):
-                    if issue_month(issue) != mk:
+                    if issue_updated_month(issue) != mk:
                         continue
                     key = issue_key(issue)
                     if not key:
@@ -310,20 +344,28 @@ def consolidate_month(year: int, month: int) -> int:
                         if fpath not in source_files:
                             source_files.append(fpath)
 
-    tickets = sorted(issues_by_key.values(), key=issue_created)
+    issues = sorted(issues_by_key.values(), key=issue_updated)
     payload = {
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "month": mk,
-        "ticket_count": len(tickets),
+        "issue_count": len(issues),
         "active_run_id": run_id,
         "source_files": source_files,
-        "tickets": tickets,
+        "issues": issues,
     }
     write_json(consolidated_file(year, month), payload)
-    return len(tickets)
+    return len(issues)
 
 
-def fetch_month(site: str, email: str, api_token: str, project: str, issue_types: List[str], year: int, month: int, force: bool) -> None:
+def fetch_month(
+    site: str,
+    email: str,
+    api_token: str,
+    project: str,
+    year: int,
+    month: int,
+    force: bool,
+) -> None:
     manifest = load_manifest()
     mk = month_key(year, month)
     status = month_fetch_status(manifest, year, month)
@@ -339,7 +381,7 @@ def fetch_month(site: str, email: str, api_token: str, project: str, issue_types
     else:
         print(f"Fetching month {mk}...")
 
-    jql = build_month_jql(project, issue_types, year, month)
+    jql = build_month_jql(project, year, month)
     run_id = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     os.makedirs(month_run_dir(year, month, run_id), exist_ok=True)
 
@@ -367,12 +409,12 @@ def fetch_month(site: str, email: str, api_token: str, project: str, issue_types
     mark_month_fetched(manifest, year, month, run_id, page_count=page, issue_count=issue_total)
     save_manifest(manifest)
 
-    count = consolidate_month(year, month)
+    issue_count = consolidate_month(year, month)
     print(f"Fetched {issue_total} ticket(s) across {page} page(s).")
-    print(f"Consolidated: {count} ticket(s) -> {consolidated_file(year, month)}")
+    print(f"Consolidated: {issue_count} issue(s) -> {consolidated_file(year, month)}")
 
 
-def check_updates(site: str, email: str, api_token: str, project: str, issue_types: List[str]) -> None:
+def check_updates(site: str, email: str, api_token: str, project: str) -> None:
     manifest = load_manifest()
     since = manifest.get("last_updates_sweep_at", "")
 
@@ -382,7 +424,7 @@ def check_updates(site: str, email: str, api_token: str, project: str, issue_typ
     else:
         print(f"Sweeping Jira updates since {since}")
 
-    jql = build_updates_jql(project, issue_types, since)
+    jql = build_updates_jql(project, since)
     pages: List[Dict] = []
 
     next_page_token = None
@@ -436,7 +478,7 @@ def check_updates(site: str, email: str, api_token: str, project: str, issue_typ
     affected_months = set()
     for page in pages:
         for issue in page.get("issues", []):
-            mk = issue_month(issue)
+            mk = issue_updated_month(issue)
             if mk:
                 affected_months.add(mk)
 
@@ -444,8 +486,8 @@ def check_updates(site: str, email: str, api_token: str, project: str, issue_typ
         print(f"Regenerating consolidated month files: {', '.join(sorted(affected_months))}")
         for mk in sorted(affected_months):
             y, m = int(mk[:4]), int(mk[5:7])
-            count = consolidate_month(y, m)
-            print(f"  {mk}: {count} ticket(s) -> {consolidated_file(y, m)}")
+            issue_count = consolidate_month(y, m)
+            print(f"  {mk}: {issue_count} issue(s) -> {consolidated_file(y, m)}")
 
 
 def show_status() -> None:
@@ -457,18 +499,19 @@ def show_status() -> None:
 
     for mk in sorted(months.keys()):
         entry = months[mk]
-        c_file = os.path.join(CONSOLIDATED_DIR, f"tickets-{mk}.json")
+        c_file = os.path.join(CONSOLIDATED_DIR, f"issues-{mk}.json")
         consolidated = "yes" if os.path.exists(c_file) else "no"
         print(
             f"  {mk}  status: {entry.get('status', 'unknown')}  "
-            f"issues: {entry.get('issue_count', 0)}  pages: {entry.get('page_count', 0)}  consolidated: {consolidated}"
+            f"issues: {entry.get('issue_count', 0)}  pages: {entry.get('page_count', 0)}  "
+            f"consolidated: {consolidated}"
         )
 
     print(f"\nLast Jira update sweep: {manifest.get('last_updates_sweep_at', 'none')}")
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description="Fetch Jira tickets for configured issue types.")
+    parser = argparse.ArgumentParser(description="Fetch Jira tickets and derive monthly issue files.")
     parser.add_argument("--month", default="", help="Target month (YYYY-MM). Defaults to current month.")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if cache is marked complete.")
     parser.add_argument("--check-updates", action="store_true", help="Sweep for tickets updated since last sweep.")
@@ -485,22 +528,29 @@ def main(argv=None) -> None:
     year, month = parse_month(args.month) if args.month else (today.year, today.month)
 
     if args.consolidate_only:
-        count = consolidate_month(year, month)
-        print(f"Consolidated: {count} ticket(s) -> {consolidated_file(year, month)}")
+        issue_count = consolidate_month(year, month)
+        print(f"Consolidated: {issue_count} issue(s) -> {consolidated_file(year, month)}")
         return
 
-    site, email, api_token, project, issue_types = load_jira_runtime(args.config_file)
+    site, email, api_token, project, _ = load_jira_runtime(args.config_file)
+    config = load_jira_config(args.config_file)
+    issue_types, tags = load_vertical_support_filters(config)
 
     print(
         f"Jira ticket fetch  |  month: {month_key(year, month)}  |  "
-        f"project: {project}  |  issue_types: {', '.join(issue_types)}"
+        f"project: {project}  |  fetch_scope: all project issues"
+    )
+    print(
+        "Vertical Support filter config  |  "
+        f"issue_types: {', '.join(issue_types) if issue_types else 'none'}  |  "
+        f"tags: {', '.join(tags) if tags else 'none'}"
     )
 
     if args.check_updates:
-        check_updates(site, email, api_token, project, issue_types)
+        check_updates(site, email, api_token, project)
         return
 
-    fetch_month(site, email, api_token, project, issue_types, year, month, force=args.force)
+    fetch_month(site, email, api_token, project, year, month, force=args.force)
 
 
 if __name__ == "__main__":
