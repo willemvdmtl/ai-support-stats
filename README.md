@@ -62,11 +62,12 @@ Used for:
 
 User must provide:
 
-- Comma-separated GitHub usernames for internal team members
+- Either comma-separated GitHub usernames for internal members
+- Or team mappings for per-team split (for example `Ecommerce:davdieievttl,dbaliuk;Checkout:alice,bob`)
 
 Used for:
 
-- Internal vs external PR split chart
+- Internal team vs external PR split chart (with optional per-team internal segments)
 
 ### Capability 3: Jira minimal
 
@@ -114,6 +115,7 @@ Setup only:
 python3 scripts/setup.py
 python3 scripts/setup.py --list
 python3 scripts/setup.py --capabilities 1,2,3,4
+python3 scripts/setup.py --capabilities 2 --internal-teams "Ecommerce:user1,user2;Checkout:user3"
 ```
 
 Fetch only:

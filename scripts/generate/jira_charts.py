@@ -231,6 +231,17 @@ def _strip_service_suffix(s: str) -> str:
     return _SERVICE_SUFFIX_RE.sub('', s)
 
 
+def _service_name_from_url(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    match = re.search(r'https?://github\.com/[^/\s]+/([^/\s?#]+)', value, flags=re.IGNORECASE)
+    if not match:
+        return value
+    repo = str(match.group(1) or "").strip()
+    return repo or value
+
+
 def _build_structural_index(org_config: Dict) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
     """Build area→teams and team_key→canonical_name lookups from org structure."""
     area_to_teams: Dict[str, List[str]] = {}
@@ -428,9 +439,10 @@ def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[st
     3. Exact case-insensitive match against known canonical names
     4. Raw value fallback
     """
-    key = raw.strip().lower()
+    base = _service_name_from_url(raw)
+    key = base.strip().lower()
     if not key:
-        return raw
+        return base
 
     if key in overrides:
         return overrides[key]
@@ -445,7 +457,7 @@ def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[st
     # Fuzzy fallback for punctuation/case/spacing variants.
     compact = _compact_service_key(key)
     if not compact:
-        return raw.strip()
+        return base.strip()
 
     # Match alias keys after compacting both sides.
     for alias_key, canonical in aliases.items():
@@ -461,7 +473,7 @@ def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[st
         if compact_stem and compact_stem == _strip_service_suffix(canonical_compact):
             return name
 
-    return raw.strip()
+    return base.strip()
 
 
 def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dict:

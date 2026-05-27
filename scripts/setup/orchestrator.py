@@ -80,6 +80,8 @@ def build_capability_args(capability_id: str, args: argparse.Namespace) -> List[
             forwarded.extend(["--config-output", args.github_config_output.strip()])
 
     if capability_id == "2":
+        if args.internal_teams.strip():
+            forwarded.extend(["--teams", args.internal_teams.strip()])
         if args.internal_users.strip():
             forwarded.extend(["--users", args.internal_users.strip()])
         if args.internal_team_output.strip():
@@ -171,6 +173,11 @@ def main() -> None:
         help="Override capability config output file for capability 1",
     )
 
+    parser.add_argument(
+        "--internal-teams",
+        default="",
+        help="Team mapping for capability 2: Team A:user1,user2;Team B:user3",
+    )
     parser.add_argument(
         "--internal-users",
         default="",

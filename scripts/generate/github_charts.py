@@ -31,14 +31,52 @@ def load_prs(year: int, month: int) -> List[Dict]:
     return data.get("pull_requests", [])
 
 
-def load_internal_users() -> List[str]:
-    config_file = INTERNAL_TEAM_FILE
-    if not os.path.exists(config_file):
+def load_internal_teams() -> Dict[str, List[str]]:
+    data = read_json(INTERNAL_TEAM_FILE)
+    if not data:
         legacy = "data/config/github-internal-team.json"
         if os.path.exists(legacy):
-            config_file = legacy
-    data = read_json(config_file)
-    return data.get("internal_github_users", [])
+            data = read_json(legacy)
+
+    teams_payload = data.get("internal_teams") if isinstance(data, dict) else None
+    normalized: Dict[str, List[str]] = {}
+
+    if isinstance(teams_payload, dict):
+        for team_name, raw_users in teams_payload.items():
+            users = []
+            seen = set()
+            if not isinstance(raw_users, list):
+                continue
+            for user in raw_users:
+                login = str(user).strip()
+                if not login:
+                    continue
+                key = login.lower()
+                if key in seen:
+                    continue
+                users.append(login)
+                seen.add(key)
+            if users:
+                normalized[str(team_name).strip() or "Internal"] = users
+
+    if normalized:
+        return normalized
+
+    fallback_users = []
+    if isinstance(data, dict):
+        fallback_users = data.get("internal_github_users", [])
+    users = []
+    seen = set()
+    for user in fallback_users:
+        login = str(user).strip()
+        if not login:
+            continue
+        key = login.lower()
+        if key in seen:
+            continue
+        users.append(login)
+        seen.add(key)
+    return {"Internal": users} if users else {}
 
 
 def pr_created_day(pr: Dict) -> Optional[int]:
@@ -217,18 +255,29 @@ def generate_heatmap(prs: List[Dict], year: int, month: int) -> str:
     return out
 
 
-def generate_split_bar(prs: List[Dict], year: int, month: int, internal_users: List[str]) -> str:
+def generate_split_bar(prs: List[Dict], year: int, month: int, internal_teams: Dict[str, List[str]]) -> str:
     import matplotlib.pyplot as plt
 
     month_name = dt.date(year, month, 1).strftime("%B %Y")
 
-    if not internal_users:
+    if not internal_teams:
         print("  No internal users configured. Skipping internal/external chart.")
         print("  Run:  python3 scripts/setup.py --capabilities 2")
         return ""
 
-    internal_set = set(u.lower() for u in internal_users)
-    internal_count = 0
+    login_to_team: Dict[str, str] = {}
+    for team_name, users in internal_teams.items():
+        for user in users:
+            key = user.lower()
+            if key in login_to_team and login_to_team[key] != team_name:
+                print(
+                    "  WARNING: "
+                    f"'{user}' appears in multiple teams; using first team '{login_to_team[key]}'."
+                )
+                continue
+            login_to_team[key] = team_name
+
+    team_counts: Dict[str, int] = {name: 0 for name in internal_teams.keys()}
     external_count = 0
     unknown_count = 0
 
@@ -236,25 +285,30 @@ def generate_split_bar(prs: List[Dict], year: int, month: int, internal_users: L
         login = pr_author_login(pr).lower()
         if not login:
             unknown_count += 1
-        elif login in internal_set:
-            internal_count += 1
+        elif login in login_to_team:
+            team_counts[login_to_team[login]] += 1
         else:
             external_count += 1
 
+    internal_count = sum(team_counts.values())
     total = internal_count + external_count + unknown_count
     if total == 0:
         print(f"  No PRs found for {month_name}. Skipping split chart.")
         return ""
 
     print(f"  Internal: {internal_count} ({internal_count / total * 100:.1f}%)")
+    for team_name, count in sorted(team_counts.items(), key=lambda item: item[1], reverse=True):
+        if count:
+            print(f"    - {team_name}: {count} ({count / total * 100:.1f}%)")
     print(f"  External: {external_count} ({external_count / total * 100:.1f}%)")
     if unknown_count:
         print(f"  Unknown author: {unknown_count}")
 
-    segments = [
-        ("Internal (ecommerce)", internal_count, PALETTE["sky"]),
-        ("External", external_count, PALETTE["mint"]),
-    ]
+    colours = [PALETTE["sky"], PALETTE["teal"], PALETTE["purple"], PALETTE["peach"]]
+    segments = []
+    for index, (team_name, count) in enumerate(sorted(team_counts.items(), key=lambda item: item[1], reverse=True)):
+        segments.append((f"Internal ({team_name})", count, colours[index % len(colours)]))
+    segments.append(("External", external_count, PALETTE["mint"]))
     segments.sort(key=lambda s: s[1], reverse=True)
 
     fig, ax = plt.subplots(figsize=(10, 2.8))
@@ -262,7 +316,7 @@ def generate_split_bar(prs: List[Dict], year: int, month: int, internal_users: L
     for label, count, colour in segments:
         ax.barh(["PRs"], [count], left=[left], color=colour, label=label)
         if count > 0:
-            text_colour = "white" if colour == PALETTE["sky"] else "black"
+            text_colour = "white" if colour in {PALETTE["sky"], PALETTE["teal"], PALETTE["purple"]} else "black"
             ax.text(left + count / 2, 0, str(count), va="center", ha="center", color=text_colour, fontweight="bold")
         left += count
 
@@ -319,8 +373,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if do_split:
         print("\nInternal / external split:")
-        internal_users = load_internal_users()
-        out = generate_split_bar(prs, year, month, internal_users)
+        internal_teams = load_internal_teams()
+        out = generate_split_bar(prs, year, month, internal_teams)
         if out:
             print(f"  Saved: {out}")
 
