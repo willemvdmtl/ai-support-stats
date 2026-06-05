@@ -108,6 +108,39 @@ def pr_author_login(pr: Dict) -> str:
     return pr.get("login", "")
 
 
+def classify_pr_split(prs: List[Dict], internal_teams: Dict[str, List[str]]) -> Dict[str, object]:
+    login_to_team: Dict[str, str] = {}
+    for team_name, users in internal_teams.items():
+        for user in users:
+            key = user.lower()
+            if key in login_to_team:
+                continue
+            login_to_team[key] = team_name
+
+    team_counts: Dict[str, int] = {name: 0 for name in internal_teams.keys()}
+    external_count = 0
+    unknown_count = 0
+
+    for pr in prs:
+        login = pr_author_login(pr).lower()
+        if not login:
+            unknown_count += 1
+        elif login in login_to_team:
+            team_counts[login_to_team[login]] += 1
+        else:
+            external_count += 1
+
+    internal_count = sum(team_counts.values())
+    total = internal_count + external_count + unknown_count
+    return {
+        "team_counts": team_counts,
+        "internal_count": internal_count,
+        "external_count": external_count,
+        "unknown_count": unknown_count,
+        "total": total,
+    }
+
+
 def generate_heatmap(prs: List[Dict], year: int, month: int) -> str:
     import matplotlib.pyplot as plt
     import numpy as np
@@ -277,21 +310,12 @@ def generate_split_bar(prs: List[Dict], year: int, month: int, internal_teams: D
                 continue
             login_to_team[key] = team_name
 
-    team_counts: Dict[str, int] = {name: 0 for name in internal_teams.keys()}
-    external_count = 0
-    unknown_count = 0
-
-    for pr in prs:
-        login = pr_author_login(pr).lower()
-        if not login:
-            unknown_count += 1
-        elif login in login_to_team:
-            team_counts[login_to_team[login]] += 1
-        else:
-            external_count += 1
-
-    internal_count = sum(team_counts.values())
-    total = internal_count + external_count + unknown_count
+    split = classify_pr_split(prs, internal_teams)
+    team_counts = split["team_counts"]
+    internal_count = int(split["internal_count"])
+    external_count = int(split["external_count"])
+    unknown_count = int(split["unknown_count"])
+    total = int(split["total"])
     if total == 0:
         print(f"  No PRs found for {month_name}. Skipping split chart.")
         return ""

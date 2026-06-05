@@ -16,6 +16,7 @@ from common.setup_utils import read_json
 
 REPORTS_DIR = "reports"
 CONSOLIDATED_DIR = "cache/jira"
+CANONICAL_CREATED_DIR = "cache/jira/by-created"
 TEAM_NORMALIZATION_FILE = "config/jira-team-normalization.json"
 ORG_STRUCTURE_FILE = "config/jira-org-structure.json"
 OVERRIDES_FILE = "config/jira-team-overrides.json"
@@ -29,6 +30,10 @@ DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
 
 def consolidated_file(year: int, month: int) -> str:
     return os.path.join(CONSOLIDATED_DIR, f"issues-{year}-{month:02d}.json")
+
+
+def canonical_created_file(year: int, month: int) -> str:
+    return os.path.join(CANONICAL_CREATED_DIR, f"issues-{year}-{month:02d}.json")
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -81,7 +86,9 @@ def is_vertical_support_ticket(ticket: Dict, issue_types: set, tags: set) -> boo
 
 
 def load_tickets(year: int, month: int) -> List[Dict]:
-    path = consolidated_file(year, month)
+    path = canonical_created_file(year, month)
+    if not os.path.exists(path):
+        path = consolidated_file(year, month)
     if not os.path.exists(path):
         print(f"ERROR: No consolidated Jira data found at {path}")
         print(f"Run first:  python3 scripts/fetch-data.py jira --month {year}-{month:02d}")
@@ -207,6 +214,10 @@ def _flatten_values(value: object) -> List[str]:
 
 def _read_optional_json(path: str) -> Dict:
     return read_json(path) if os.path.exists(path) else {}
+
+
+def _has_visible_cells(mask) -> bool:
+    return (~mask).to_numpy().any()
 
 
 _SEGMENT_SEP_RE = re.compile(r'\s+-\s+|\s+[\u2013\u2014]\s+')
@@ -684,49 +695,53 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
     fig_height = max(4, (len(components) + 1) * 0.5 + 1.5)
     fig, ax = plt.subplots(figsize=(17, fig_height))
 
-    sns.heatmap(
-        df,
-        annot=annot,
-        fmt="",
-        cmap=build_colormap("sky_purple"),
-        cbar_kws={"label": "Tickets (daily cells)"},
-        linewidths=0.5,
-        linecolor="lightgray",
-        vmin=0,
-        vmax=vmax_data,
-        mask=data_mask,
-        ax=ax,
-    )
+    if _has_visible_cells(data_mask):
+        sns.heatmap(
+            df,
+            annot=annot,
+            fmt="",
+            cmap=build_colormap("sky_purple"),
+            cbar_kws={"label": "Tickets (daily cells)"},
+            linewidths=0.5,
+            linecolor="lightgray",
+            vmin=0,
+            vmax=vmax_data,
+            mask=data_mask,
+            ax=ax,
+        )
 
-    sns.heatmap(
-        df,
-        annot=annot,
-        fmt="",
-        cmap=build_colormap("peach_purple"),
-        cbar=False,
-        linewidths=0.5,
-        linecolor="lightgray",
-        vmin=0,
-        vmax=vmax_totals,
-        mask=totals_mask,
-        ax=ax,
-    )
+    if _has_visible_cells(totals_mask):
+        sns.heatmap(
+            df,
+            annot=annot,
+            fmt="",
+            cmap=build_colormap("peach_purple"),
+            cbar=False,
+            linewidths=0.5,
+            linecolor="lightgray",
+            vmin=0,
+            vmax=vmax_totals,
+            mask=totals_mask,
+            ax=ax,
+        )
 
     weekend_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
     for d in weekend_days:
         if str(d) in weekend_mask.columns:
             weekend_mask[str(d)] = True
 
-    sns.heatmap(
-        df,
-        cmap=ListedColormap(["#d0d0d0"]),
-        cbar=False,
-        linewidths=0.5,
-        linecolor="lightgray",
-        annot=False,
-        mask=~(weekend_mask & ~df.isna()),
-        ax=ax,
-    )
+    weekend_overlay_mask = ~(weekend_mask & ~df.isna())
+    if _has_visible_cells(weekend_overlay_mask):
+        sns.heatmap(
+            df,
+            cmap=ListedColormap(["#d0d0d0"]),
+            cbar=False,
+            linewidths=0.5,
+            linecolor="lightgray",
+            annot=False,
+            mask=weekend_overlay_mask,
+            ax=ax,
+        )
 
     ax.hlines([len(components)], *ax.get_xlim(), colors="black", linewidths=2.5)
     ax.vlines([days_in_month], *ax.get_ylim(), colors="black", linewidths=2.5)
@@ -856,49 +871,53 @@ def generate_team_heatmap(derived_payload: Dict, year: int, month: int) -> str:
     fig_height = max(4, (len(teams) + 1) * 0.5 + 1.5)
     fig, ax = plt.subplots(figsize=(17, fig_height))
 
-    sns.heatmap(
-        df,
-        annot=annot,
-        fmt="",
-        cmap=build_colormap("sky_purple"),
-        cbar_kws={"label": "Tickets (daily cells)"},
-        linewidths=0.5,
-        linecolor="lightgray",
-        vmin=0,
-        vmax=vmax_data,
-        mask=data_mask,
-        ax=ax,
-    )
+    if _has_visible_cells(data_mask):
+        sns.heatmap(
+            df,
+            annot=annot,
+            fmt="",
+            cmap=build_colormap("sky_purple"),
+            cbar_kws={"label": "Tickets (daily cells)"},
+            linewidths=0.5,
+            linecolor="lightgray",
+            vmin=0,
+            vmax=vmax_data,
+            mask=data_mask,
+            ax=ax,
+        )
 
-    sns.heatmap(
-        df,
-        annot=annot,
-        fmt="",
-        cmap=build_colormap("peach_purple"),
-        cbar=False,
-        linewidths=0.5,
-        linecolor="lightgray",
-        vmin=0,
-        vmax=vmax_totals,
-        mask=totals_mask,
-        ax=ax,
-    )
+    if _has_visible_cells(totals_mask):
+        sns.heatmap(
+            df,
+            annot=annot,
+            fmt="",
+            cmap=build_colormap("peach_purple"),
+            cbar=False,
+            linewidths=0.5,
+            linecolor="lightgray",
+            vmin=0,
+            vmax=vmax_totals,
+            mask=totals_mask,
+            ax=ax,
+        )
 
     weekend_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
     for d in weekend_days:
         if str(d) in weekend_mask.columns:
             weekend_mask[str(d)] = True
 
-    sns.heatmap(
-        df,
-        cmap=ListedColormap(["#d0d0d0"]),
-        cbar=False,
-        linewidths=0.5,
-        linecolor="lightgray",
-        annot=False,
-        mask=~(weekend_mask & ~df.isna()),
-        ax=ax,
-    )
+    weekend_overlay_mask = ~(weekend_mask & ~df.isna())
+    if _has_visible_cells(weekend_overlay_mask):
+        sns.heatmap(
+            df,
+            cmap=ListedColormap(["#d0d0d0"]),
+            cbar=False,
+            linewidths=0.5,
+            linecolor="lightgray",
+            annot=False,
+            mask=weekend_overlay_mask,
+            ax=ax,
+        )
 
     ax.hlines([len(teams)], *ax.get_xlim(), colors="black", linewidths=2.5)
     ax.vlines([days_in_month], *ax.get_ylim(), colors="black", linewidths=2.5)

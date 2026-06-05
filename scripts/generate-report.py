@@ -12,8 +12,10 @@ from common.setup_utils import read_json
 REPORTS_DIR = "reports"
 GITHUB_CACHE_DIR = "cache/github"
 JIRA_CACHE_DIR = "cache/jira"
+JIRA_CANONICAL_CREATED_DIR = "cache/jira/by-created"
 JIRA_CONFIG_FILE = "config/jira-minimal.json"
 METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
+INTERNAL_TEAM_FILE = "config/github-internal-team.json"
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -230,6 +232,108 @@ def chart_files(year: int, month: int) -> Dict[str, str]:
     }
 
 
+def consolidated_github_file(year: int, month: int) -> str:
+    return os.path.join(GITHUB_CACHE_DIR, f"prs-{year}-{month:02d}.json")
+
+
+def load_prs(year: int, month: int) -> List[Dict]:
+    path = consolidated_github_file(year, month)
+    if not os.path.exists(path):
+        print(f"ERROR: No consolidated data found at {path}")
+        print(f"Run first:  python3 scripts/fetch-data.py github --month {year}-{month:02d}")
+        sys.exit(1)
+    data = read_json(path)
+    return data.get("pull_requests", [])
+
+
+def load_internal_teams() -> Dict[str, List[str]]:
+    data = read_json(INTERNAL_TEAM_FILE)
+    if not data:
+        legacy = "data/config/github-internal-team.json"
+        if os.path.exists(legacy):
+            data = read_json(legacy)
+
+    teams_payload = data.get("internal_teams") if isinstance(data, dict) else None
+    normalized: Dict[str, List[str]] = {}
+
+    if isinstance(teams_payload, dict):
+        for team_name, raw_users in teams_payload.items():
+            users = []
+            seen = set()
+            if not isinstance(raw_users, list):
+                continue
+            for user in raw_users:
+                login = str(user).strip()
+                if not login:
+                    continue
+                key = login.lower()
+                if key in seen:
+                    continue
+                users.append(login)
+                seen.add(key)
+            if users:
+                normalized[str(team_name).strip() or "Internal"] = users
+
+    if normalized:
+        return normalized
+
+    fallback_users = []
+    if isinstance(data, dict):
+        fallback_users = data.get("internal_github_users", [])
+    users = []
+    seen = set()
+    for user in fallback_users:
+        login = str(user).strip()
+        if not login:
+            continue
+        key = login.lower()
+        if key in seen:
+            continue
+        users.append(login)
+        seen.add(key)
+    return {"Internal": users} if users else {}
+
+
+def pr_author_login(pr: Dict) -> str:
+    user = pr.get("user")
+    if isinstance(user, dict):
+        return user.get("login", "")
+    return pr.get("login", "")
+
+
+def classify_pr_split(prs: List[Dict], internal_teams: Dict[str, List[str]]) -> Dict[str, object]:
+    login_to_team: Dict[str, str] = {}
+    for team_name, users in internal_teams.items():
+        for user in users:
+            key = user.lower()
+            if key in login_to_team:
+                continue
+            login_to_team[key] = team_name
+
+    team_counts: Dict[str, int] = {name: 0 for name in internal_teams.keys()}
+    external_count = 0
+    unknown_count = 0
+
+    for pr in prs:
+        login = pr_author_login(pr).lower()
+        if not login:
+            unknown_count += 1
+        elif login in login_to_team:
+            team_counts[login_to_team[login]] += 1
+        else:
+            external_count += 1
+
+    internal_count = sum(team_counts.values())
+    total = internal_count + external_count + unknown_count
+    return {
+        "team_counts": team_counts,
+        "internal_count": internal_count,
+        "external_count": external_count,
+        "unknown_count": unknown_count,
+        "total": total,
+    }
+
+
 def parse_jira_datetime(raw: str) -> Optional[dt.datetime]:
     if not raw:
         return None
@@ -298,14 +402,15 @@ def resolve_window(year: int, month: int, policy: Dict[str, object]) -> Tuple[Tu
 
 
 def all_jira_tickets() -> List[Dict]:
-    if not os.path.exists(JIRA_CACHE_DIR):
+    scan_dir = JIRA_CANONICAL_CREATED_DIR if os.path.exists(JIRA_CANONICAL_CREATED_DIR) else JIRA_CACHE_DIR
+    if not os.path.exists(scan_dir):
         return []
 
     tickets_by_key: Dict[str, Dict] = {}
-    for name in sorted(os.listdir(JIRA_CACHE_DIR)):
+    for name in sorted(os.listdir(scan_dir)):
         if not name.startswith("issues-") or not name.endswith(".json"):
             continue
-        path = os.path.join(JIRA_CACHE_DIR, name)
+        path = os.path.join(scan_dir, name)
         payload = read_json(path)
         for ticket in payload.get("issues", []):
             key = str(ticket.get("key") or "")
@@ -314,6 +419,34 @@ def all_jira_tickets() -> List[Dict]:
             tickets_by_key[key] = ticket
 
     return list(tickets_by_key.values())
+
+
+def github_pr_split_stats(year: int, month: int) -> Optional[Dict[str, object]]:
+    try:
+        prs = load_prs(year, month)
+    except SystemExit:
+        return None
+
+    internal_teams = load_internal_teams()
+    if not internal_teams:
+        return None
+
+    split = classify_pr_split(prs, internal_teams)
+    total = int(split.get("total") or 0)
+    if total == 0:
+        return None
+
+    internal_count = int(split.get("internal_count") or 0)
+    external_count = int(split.get("external_count") or 0)
+    unknown_count = int(split.get("unknown_count") or 0)
+    return {
+        "internal_count": internal_count,
+        "external_count": external_count,
+        "unknown_count": unknown_count,
+        "total": total,
+        "internal_pct": internal_count / total * 100,
+        "external_pct": external_count / total * 100,
+    }
 
 
 def select_group_tickets(all_tickets: List[Dict], group: Dict[str, object]) -> List[Dict]:
@@ -397,6 +530,7 @@ def image_block(path: str, alt_text: str, report_dir: str) -> str:
 def build_report(year: int, month: int, report_dir: str) -> str:
     month_label = dt.date(year, month, 1).strftime("%B %Y")
     charts = chart_files(year, month)
+    pr_split = github_pr_split_stats(year, month)
 
     all_tickets = all_jira_tickets()
     policy = load_metric_groups_policy()
@@ -446,6 +580,18 @@ def build_report(year: int, month: int, report_dir: str) -> str:
 
     for line in group_lines:
         lines.extend([line, ""])
+
+    if pr_split is None:
+        lines.extend(["**Internal vs External PRs:** unavailable", ""])
+    else:
+        stat_line = (
+            "**Internal vs External PRs:** "
+            f"External {pr_split['external_pct']:.1f}% ({pr_split['external_count']}/{pr_split['total']}), "
+            f"Internal {pr_split['internal_pct']:.1f}% ({pr_split['internal_count']}/{pr_split['total']})"
+        )
+        if pr_split["unknown_count"]:
+            stat_line += f", Unknown {pr_split['unknown_count']}"
+        lines.extend([stat_line, ""])
 
     lines.extend([
         longest_wait_line,

@@ -12,9 +12,11 @@ Cache layout:
   cache/jira/manifest.json
       Fetch coverage and sweep history.
 
-  cache/jira/issues-YYYY-MM.json
-      Canonical derived month file containing all Jira issue types.
-      Consumers apply filtering at processing time.
+  cache/jira/by-created/issues-YYYY-MM.json
+      Canonical issue storage partitioned by issue created month.
+
+  cache/jira/index-updated/updated-YYYY-MM.json
+      Thin index of keys updated in the month, for activity tracking.
 """
 
 import argparse
@@ -35,6 +37,8 @@ MANIFEST_FILE = "cache/jira/manifest.json"
 RAW_DIR = "cache/jira/raw"
 UPDATES_DIR = "cache/jira/updates"
 CONSOLIDATED_DIR = "cache/jira"
+CANONICAL_CREATED_DIR = "cache/jira/by-created"
+UPDATED_INDEX_DIR = "cache/jira/index-updated"
 
 DEFAULT_MAX_AGE_HOURS = 4
 REQUEST_DELAY_SECONDS = 1
@@ -151,8 +155,9 @@ def build_month_jql(project: str, year: int, month: int) -> str:
     start, end = month_bounds(year, month)
     return (
         f"project = {quote_jql(project)} "
-        f"AND updated >= {quote_jql(start)} "
-        f"AND updated < {quote_jql(end)} "
+        f"AND ((updated >= {quote_jql(start)} AND updated < {quote_jql(end)}) "
+        f"OR (created >= {quote_jql(start)} AND created < {quote_jql(end)}) "
+        f"OR (resolved >= {quote_jql(start)} AND resolved < {quote_jql(end)})) "
         f"ORDER BY updated ASC"
     )
 
@@ -227,6 +232,14 @@ def consolidated_file(year: int, month: int) -> str:
     return os.path.join(CONSOLIDATED_DIR, f"issues-{month_key(year, month)}.json")
 
 
+def canonical_created_file(mk: str) -> str:
+    return os.path.join(CANONICAL_CREATED_DIR, f"issues-{mk}.json")
+
+
+def updated_index_file(mk: str) -> str:
+    return os.path.join(UPDATED_INDEX_DIR, f"updated-{mk}.json")
+
+
 def issue_key(issue: Dict) -> str:
     return issue.get("key", "")
 
@@ -297,6 +310,149 @@ def issue_updated_month(issue: Dict) -> str:
     return updated[:7] if len(updated) >= 7 else ""
 
 
+def issue_created_month(issue: Dict) -> str:
+    created = issue_created(issue)
+    return created[:7] if len(created) >= 7 else ""
+
+
+def ensure_created_cache_seeded() -> None:
+    os.makedirs(CANONICAL_CREATED_DIR, exist_ok=True)
+    existing_created = [
+        name for name in os.listdir(CANONICAL_CREATED_DIR)
+        if name.startswith("issues-") and name.endswith(".json")
+    ]
+    if existing_created:
+        return
+
+    legacy_files = [
+        name for name in os.listdir(CONSOLIDATED_DIR)
+        if name.startswith("issues-") and name.endswith(".json")
+    ] if os.path.isdir(CONSOLIDATED_DIR) else []
+    if not legacy_files:
+        return
+
+    issues_by_key: Dict[str, Dict] = {}
+    for name in sorted(legacy_files):
+        path = os.path.join(CONSOLIDATED_DIR, name)
+        payload = read_json(path)
+        for issue in payload.get("issues", []):
+            key = issue_key(issue)
+            if not key:
+                continue
+            existing = issues_by_key.get(key)
+            if not existing or issue_updated(issue) > issue_updated(existing):
+                issues_by_key[key] = issue
+
+    partitions: Dict[str, Dict[str, Dict]] = {}
+    for issue in issues_by_key.values():
+        mk = issue_created_month(issue)
+        if not mk:
+            mk = issue_updated_month(issue)
+        if not mk:
+            continue
+        bucket = partitions.setdefault(mk, {})
+        bucket[issue_key(issue)] = issue
+
+    for mk, by_key in partitions.items():
+        issues = sorted(by_key.values(), key=issue_created)
+        write_json(
+            canonical_created_file(mk),
+            {
+                "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+                "month": mk,
+                "partition": "created",
+                "issue_count": len(issues),
+                "issues": issues,
+            },
+        )
+
+
+def upsert_canonical_created(issues: List[Dict]) -> Dict[str, int]:
+    os.makedirs(CANONICAL_CREATED_DIR, exist_ok=True)
+    touched_counts: Dict[str, int] = {}
+    grouped: Dict[str, List[Dict]] = {}
+    for issue in issues:
+        mk = issue_created_month(issue)
+        if not mk:
+            mk = issue_updated_month(issue)
+        if not mk:
+            continue
+        grouped.setdefault(mk, []).append(issue)
+
+    for mk, month_issues in grouped.items():
+        path = canonical_created_file(mk)
+        payload = read_json(path) if os.path.exists(path) else {}
+        by_key: Dict[str, Dict] = {}
+        for issue in payload.get("issues", []):
+            key = issue_key(issue)
+            if key:
+                by_key[key] = issue
+
+        changed = 0
+        for issue in month_issues:
+            key = issue_key(issue)
+            if not key:
+                continue
+            existing = by_key.get(key)
+            if not existing or issue_updated(issue) >= issue_updated(existing):
+                by_key[key] = issue
+                changed += 1
+
+        merged = sorted(by_key.values(), key=issue_created)
+        write_json(
+            path,
+            {
+                "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+                "month": mk,
+                "partition": "created",
+                "issue_count": len(merged),
+                "issues": merged,
+            },
+        )
+        touched_counts[mk] = changed
+
+    return touched_counts
+
+
+def write_updated_index(year: int, month: int, issues: List[Dict], run_id: str, source_files: List[str]) -> None:
+    mk = month_key(year, month)
+    os.makedirs(UPDATED_INDEX_DIR, exist_ok=True)
+
+    by_key: Dict[str, Dict] = {}
+    for issue in issues:
+        key = issue_key(issue)
+        if not key:
+            continue
+        existing = by_key.get(key)
+        if not existing or issue_updated(issue) > issue_updated(existing):
+            by_key[key] = issue
+
+    entries = []
+    for key in sorted(by_key.keys()):
+        issue = by_key[key]
+        entries.append(
+            {
+                "key": key,
+                "created": issue_created(issue),
+                "updated": issue_updated(issue),
+                "resolutiondate": (issue.get("fields") or {}).get("resolutiondate", ""),
+            }
+        )
+
+    write_json(
+        updated_index_file(mk),
+        {
+            "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+            "month": mk,
+            "partition": "updated_index",
+            "active_run_id": run_id,
+            "issue_count": len(entries),
+            "source_files": source_files,
+            "issues": entries,
+        },
+    )
+
+
 def consolidate_month(year: int, month: int) -> int:
     mk = month_key(year, month)
     manifest = load_manifest()
@@ -345,15 +501,10 @@ def consolidate_month(year: int, month: int) -> int:
                             source_files.append(fpath)
 
     issues = sorted(issues_by_key.values(), key=issue_updated)
-    payload = {
-        "generated_at": dt.datetime.utcnow().isoformat() + "Z",
-        "month": mk,
-        "issue_count": len(issues),
-        "active_run_id": run_id,
-        "source_files": source_files,
-        "issues": issues,
-    }
-    write_json(consolidated_file(year, month), payload)
+
+    ensure_created_cache_seeded()
+    upsert_canonical_created(issues)
+    write_updated_index(year, month, issues, run_id, source_files)
     return len(issues)
 
 
@@ -411,7 +562,7 @@ def fetch_month(
 
     issue_count = consolidate_month(year, month)
     print(f"Fetched {issue_total} ticket(s) across {page} page(s).")
-    print(f"Consolidated: {issue_count} issue(s) -> {consolidated_file(year, month)}")
+    print(f"Updated index: {issue_count} issue(s) -> {updated_index_file(month_key(year, month))}")
 
 
 def check_updates(site: str, email: str, api_token: str, project: str) -> None:
@@ -483,11 +634,11 @@ def check_updates(site: str, email: str, api_token: str, project: str) -> None:
                 affected_months.add(mk)
 
     if affected_months:
-        print(f"Regenerating consolidated month files: {', '.join(sorted(affected_months))}")
+        print(f"Regenerating updated indexes: {', '.join(sorted(affected_months))}")
         for mk in sorted(affected_months):
             y, m = int(mk[:4]), int(mk[5:7])
             issue_count = consolidate_month(y, m)
-            print(f"  {mk}: {issue_count} issue(s) -> {consolidated_file(y, m)}")
+            print(f"  {mk}: {issue_count} issue(s) -> {updated_index_file(mk)}")
 
 
 def show_status() -> None:
@@ -499,12 +650,14 @@ def show_status() -> None:
 
     for mk in sorted(months.keys()):
         entry = months[mk]
-        c_file = os.path.join(CONSOLIDATED_DIR, f"issues-{mk}.json")
-        consolidated = "yes" if os.path.exists(c_file) else "no"
+        c_file = canonical_created_file(mk)
+        canonical = "yes" if os.path.exists(c_file) else "no"
+        u_file = updated_index_file(mk)
+        updated_index = "yes" if os.path.exists(u_file) else "no"
         print(
             f"  {mk}  status: {entry.get('status', 'unknown')}  "
             f"issues: {entry.get('issue_count', 0)}  pages: {entry.get('page_count', 0)}  "
-            f"consolidated: {consolidated}"
+            f"canonical_created: {canonical}  updated_index: {updated_index}"
         )
 
     print(f"\nLast Jira update sweep: {manifest.get('last_updates_sweep_at', 'none')}")
@@ -529,7 +682,7 @@ def main(argv=None) -> None:
 
     if args.consolidate_only:
         issue_count = consolidate_month(year, month)
-        print(f"Consolidated: {issue_count} issue(s) -> {consolidated_file(year, month)}")
+        print(f"Updated index: {issue_count} issue(s) -> {updated_index_file(month_key(year, month))}")
         return
 
     site, email, api_token, project, _ = load_jira_runtime(args.config_file)
