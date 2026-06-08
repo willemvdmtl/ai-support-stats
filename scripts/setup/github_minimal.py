@@ -25,22 +25,29 @@ def discover_repositories(token: str, org: str, owners: List[str]) -> List[str]:
     by_repo: Dict[str, List[str]] = {}
 
     for owner in owners:
-        query = f'org:{org} filename:catalog-info.yaml "owner: {owner}"'
-        print(f"Running GitHub code search: {query}")
-        try:
-            items = github_search_code(token, query)
-        except Exception as exc:
-            print(f"ERROR: GitHub discovery call failed for owner '{owner}': {exc}")
-            sys.exit(1)
+        # Search both unquoted and YAML-quoted forms of the owner value, e.g.:
+        #   owner: customer-identity
+        #   owner: "customer-identity"
+        queries = [
+            f'org:{org} filename:catalog-info.yaml "owner: {owner}"',
+            f'org:{org} filename:catalog-info.yaml "owner: \\"{owner}\\""',
+        ]
+        for query in queries:
+            print(f"Running GitHub code search: {query}")
+            try:
+                items = github_search_code(token, query)
+            except Exception as exc:
+                print(f"ERROR: GitHub discovery call failed for owner '{owner}': {exc}")
+                sys.exit(1)
 
-        for item in items:
-            repo = (item.get("repository") or {}).get("full_name")
-            path = item.get("path") or "catalog-info.yaml"
-            if not repo:
-                continue
-            by_repo.setdefault(repo, [])
-            if path not in by_repo[repo]:
-                by_repo[repo].append(path)
+            for item in items:
+                repo = (item.get("repository") or {}).get("full_name")
+                path = item.get("path") or "catalog-info.yaml"
+                if not repo:
+                    continue
+                by_repo.setdefault(repo, [])
+                if path not in by_repo[repo]:
+                    by_repo[repo].append(path)
 
     return sorted(by_repo.keys())
 
@@ -85,7 +92,14 @@ def main() -> None:
         sys.exit(1)
 
     repositories = discover_repositories(github_token, org, owners)
-    search_queries = [f'org:{org} filename:catalog-info.yaml "owner: {owner}"' for owner in owners]
+    search_queries = [
+        query
+        for owner in owners
+        for query in [
+            f'org:{org} filename:catalog-info.yaml "owner: {owner}"',
+            f'org:{org} filename:catalog-info.yaml "owner: \\"{owner}\\""',
+        ]
+    ]
 
     output_payload = {
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",

@@ -2,12 +2,13 @@
 """Capability orchestrator for setup workflows."""
 
 import argparse
+import datetime as dt
 import os
 import subprocess
 import sys
 from typing import Dict, List
 
-from common.setup_utils import check_python_requirements
+from common.setup_utils import check_python_requirements, read_json, write_json
 
 
 CAPABILITIES: List[Dict[str, str]] = [
@@ -37,6 +38,42 @@ CAPABILITIES: List[Dict[str, str]] = [
         "script": os.path.join("setup", "jira_service_normalization.py"),
     },
 ]
+
+GITHUB_CONFIG_PATH = "config/github-minimal.json"
+JIRA_CONFIG_PATH = "config/jira-minimal.json"
+
+
+def normalize_github_anchor(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"closed", "closed_at", "close", "closing"}:
+        return "closed"
+    return "created"
+
+
+def normalize_jira_anchor(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"resolved", "resolution", "resolved_at", "resolutiondate", "closing", "closed"}:
+        return "resolved"
+    return "created"
+
+
+def prompt_anchor(prompt_text: str, default_value: str, allowed_values: set) -> str:
+    while True:
+        entered = input(prompt_text).strip().lower()
+        resolved = entered or default_value
+        if resolved in allowed_values:
+            return resolved
+        print(f"ERROR: Invalid value '{entered}'. Valid options: {', '.join(sorted(allowed_values))}")
+
+
+def upsert_anchor(config_path: str, key: str, value: str, label: str) -> None:
+    payload = read_json(config_path)
+    if not isinstance(payload, dict):
+        payload = {}
+    payload[key] = value
+    payload["anchor_configured_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    write_json(config_path, payload)
+    print(f"Configured {label}: {value} ({config_path})")
 
 
 def parse_selection(raw: str) -> List[Dict[str, str]]:
@@ -272,6 +309,16 @@ def main() -> None:
         default="",
         help="Override service normalization output file for capability 5",
     )
+    parser.add_argument(
+        "--github-date-anchor",
+        default="",
+        help="GitHub chart/fetch date anchor: created or closed",
+    )
+    parser.add_argument(
+        "--jira-date-anchor",
+        default="",
+        help="Jira heatmap date anchor: created or resolved",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -301,6 +348,32 @@ def main() -> None:
 
     for capability in selected:
         run_capability(script_dir, capability, args)
+
+    selected_ids = {capability["id"] for capability in selected}
+
+    github_anchor = ""
+    if args.github_date_anchor.strip():
+        github_anchor = normalize_github_anchor(args.github_date_anchor)
+    elif {"1", "2"}.issubset(selected_ids):
+        github_anchor = prompt_anchor(
+            "GitHub date anchor for PR Heatmap + Internal/External chart [created/closed] [created]: ",
+            "created",
+            {"created", "closed"},
+        )
+    if github_anchor:
+        upsert_anchor(GITHUB_CONFIG_PATH, "pr_date_anchor", github_anchor, "GitHub PR date anchor")
+
+    jira_anchor = ""
+    if args.jira_date_anchor.strip():
+        jira_anchor = normalize_jira_anchor(args.jira_date_anchor)
+    elif selected_ids.intersection({"3", "4", "5"}) and os.path.exists(JIRA_CONFIG_PATH):
+        jira_anchor = prompt_anchor(
+            "Jira date anchor for Service + Requesting Team heatmaps [created/resolved] [created]: ",
+            "created",
+            {"created", "resolved"},
+        )
+    if jira_anchor:
+        upsert_anchor(JIRA_CONFIG_PATH, "heatmap_date_anchor", jira_anchor, "Jira heatmap date anchor")
 
     print("\nSetup orchestration complete.")
 

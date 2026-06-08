@@ -14,12 +14,30 @@ from typing import Dict, List, Optional, Tuple
 from common.setup_utils import check_github_auth, read_json, write_json
 
 REPOS_FILE = "config/owned-repositories.json"
+GITHUB_CONFIG_FILE = "config/github-minimal.json"
 MANIFEST_FILE = "cache/github/manifest.json"
 RAW_DIR = "cache/github/raw"
 UPDATES_DIR = "cache/github/updates"
 CONSOLIDATED_DIR = "cache/github"
 DEFAULT_MAX_AGE_HOURS = 4
 SEARCH_DELAY_SECONDS = 2
+
+
+def load_pr_date_anchor() -> str:
+    """Return PR date anchor from config; defaults to 'created'."""
+    data = read_json(GITHUB_CONFIG_FILE) if os.path.exists(GITHUB_CONFIG_FILE) else {}
+    raw = str(
+        (data.get("pr_date_anchor") if isinstance(data, dict) else "")
+        or (data.get("pr_event_anchor") if isinstance(data, dict) else "")
+        or "created"
+    ).strip().lower()
+    if raw in {"closed", "closed_at", "close"}:
+        return "closed"
+    return "created"
+
+
+def pr_anchor_field(date_anchor: str) -> str:
+    return "closed_at" if date_anchor == "closed" else "created_at"
 
 
 def _github_request(token: str, url: str, params: Optional[Dict] = None) -> Dict:
@@ -33,14 +51,17 @@ def _github_request(token: str, url: str, params: Optional[Dict] = None) -> Dict
         return json.loads(resp.read().decode("utf-8"))
 
 
-def search_prs_for_repo_month(token: str, repo: str, year: int, month: int) -> List[Dict]:
+def search_prs_for_repo_month(token: str, repo: str, year: int, month: int, date_anchor: str = "created") -> List[Dict]:
     start = dt.date(year, month, 1)
     if month == 12:
         end = dt.date(year + 1, 1, 1) - dt.timedelta(days=1)
     else:
         end = dt.date(year, month + 1, 1) - dt.timedelta(days=1)
 
-    query = f"repo:{repo} is:pr created:{start.isoformat()}..{end.isoformat()}"
+    if date_anchor == "closed":
+        query = f"repo:{repo} is:pr is:closed closed:{start.isoformat()}..{end.isoformat()}"
+    else:
+        query = f"repo:{repo} is:pr created:{start.isoformat()}..{end.isoformat()}"
     all_items: List[Dict] = []
     page = 1
 
@@ -165,8 +186,9 @@ def mark_repo_fetched(manifest: Dict, year: int, month: int, repo: str, pr_count
     }
 
 
-def consolidate_month(year: int, month: int) -> int:
+def consolidate_month(year: int, month: int, date_anchor: str = "created") -> int:
     mk = month_key(year, month)
+    anchor_field = pr_anchor_field(date_anchor)
     raw_month_dir = raw_dir_for_month(year, month)
     prs_by_key: Dict[Tuple, Dict] = {}
     source_files: List[str] = []
@@ -191,8 +213,8 @@ def consolidate_month(year: int, month: int) -> int:
             fpath = os.path.join(UPDATES_DIR, fname)
             updates = read_json(fpath)
             for pr in updates.get("pull_requests", []):
-                created = pr.get("created_at", "")
-                if not created.startswith(mk):
+                anchor_value = pr.get(anchor_field, "")
+                if not anchor_value.startswith(mk):
                     continue
                 key = pr_key(pr)
                 existing = prs_by_key.get(key)
@@ -201,11 +223,12 @@ def consolidate_month(year: int, month: int) -> int:
                     if fpath not in source_files:
                         source_files.append(fpath)
 
-    sorted_prs = sorted(prs_by_key.values(), key=lambda p: p.get("created_at", ""))
+    sorted_prs = sorted(prs_by_key.values(), key=lambda p: p.get(anchor_field, "") or p.get("created_at", ""))
 
     payload = {
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "month": mk,
+        "date_anchor": date_anchor,
         "pr_count": len(sorted_prs),
         "source_files": source_files,
         "pull_requests": sorted_prs,
@@ -215,6 +238,7 @@ def consolidate_month(year: int, month: int) -> int:
 
 
 def cmd_fetch(repos: List[str], year: int, month: int, token: str, force: bool) -> None:
+    date_anchor = load_pr_date_anchor()
     manifest = load_manifest()
     mk = month_key(year, month)
     os.makedirs(raw_dir_for_month(year, month), exist_ok=True)
@@ -231,7 +255,7 @@ def cmd_fetch(repos: List[str], year: int, month: int, token: str, force: bool) 
         print(f"  [{'force' if status == 'complete' and force else status}] {repo}")
 
         try:
-            prs = search_prs_for_repo_month(token, repo, year, month)
+            prs = search_prs_for_repo_month(token, repo, year, month, date_anchor=date_anchor)
         except Exception as exc:
             print(f"  ERROR fetching {repo}: {exc}")
             continue
@@ -240,6 +264,7 @@ def cmd_fetch(repos: List[str], year: int, month: int, token: str, force: bool) 
             "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
             "repo": repo,
             "month": mk,
+            "date_anchor": date_anchor,
             "date_range": {
                 "start": dt.date(year, month, 1).isoformat(),
                 "end": (
@@ -262,13 +287,15 @@ def cmd_fetch(repos: List[str], year: int, month: int, token: str, force: bool) 
         print(f"  Skipped {total_skipped} repo(s) with complete cache (use --force to re-fetch)")
 
     if needs_consolidate:
-        pr_count = consolidate_month(year, month)
+        pr_count = consolidate_month(year, month, date_anchor=date_anchor)
         print(f"\nConsolidated: {pr_count} PR(s) in {mk}  -> {consolidated_file(year, month)}")
     else:
         print(f"\nAll repos already complete for {mk}. Nothing to fetch.")
 
 
 def cmd_check_updates(token: str, org: str) -> None:
+    date_anchor = load_pr_date_anchor()
+    anchor_field = pr_anchor_field(date_anchor)
     manifest = load_manifest()
     since = manifest.get("last_updates_sweep_at", "")
 
@@ -311,20 +338,21 @@ def cmd_check_updates(token: str, org: str) -> None:
 
     affected_months = set()
     for pr in prs:
-        created = pr.get("created_at", "")
-        if len(created) >= 7:
-            affected_months.add(created[:7])
+        anchor_value = pr.get(anchor_field, "")
+        if len(anchor_value) >= 7:
+            affected_months.add(anchor_value[:7])
 
     if affected_months:
         print(f"\nRegenerating consolidated files for: {', '.join(sorted(affected_months))}")
         for mk in sorted(affected_months):
             y, m = int(mk[:4]), int(mk[5:7])
-            pr_count = consolidate_month(y, m)
+            pr_count = consolidate_month(y, m, date_anchor=date_anchor)
             print(f"  {mk}: {pr_count} PR(s)  ->  {consolidated_file(y, m)}")
 
 
 def cmd_consolidate_only(year: int, month: int) -> None:
-    pr_count = consolidate_month(year, month)
+    date_anchor = load_pr_date_anchor()
+    pr_count = consolidate_month(year, month, date_anchor=date_anchor)
     mk = month_key(year, month)
     print(f"Consolidated: {pr_count} PR(s) for {mk}  ->  {consolidated_file(year, month)}")
 
@@ -411,7 +439,10 @@ def main(argv=None) -> None:
         sys.exit(1)
 
     mk = month_key(year, month)
-    print(f"GitHub PR fetch  |  month: {mk}  |  org: {org}  |  repos: {len(repos)}")
+    print(
+        f"GitHub PR fetch  |  month: {mk}  |  org: {org}  |  repos: {len(repos)}"
+        f"  |  date_anchor: {load_pr_date_anchor()}"
+    )
 
     if args.check_updates:
         cmd_check_updates(token, org)

@@ -14,6 +14,7 @@ GITHUB_CACHE_DIR = "cache/github"
 JIRA_CACHE_DIR = "cache/jira"
 JIRA_CANONICAL_CREATED_DIR = "cache/jira/by-created"
 JIRA_CONFIG_FILE = "config/jira-minimal.json"
+GITHUB_CONFIG_FILE = "config/github-minimal.json"
 METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
 INTERNAL_TEAM_FILE = "config/github-internal-team.json"
 
@@ -236,14 +237,33 @@ def consolidated_github_file(year: int, month: int) -> str:
     return os.path.join(GITHUB_CACHE_DIR, f"prs-{year}-{month:02d}.json")
 
 
-def load_prs(year: int, month: int) -> List[Dict]:
+def load_pr_date_anchor() -> str:
+    data = read_json(GITHUB_CONFIG_FILE) if os.path.exists(GITHUB_CONFIG_FILE) else {}
+    raw = str(
+        (data.get("pr_date_anchor") if isinstance(data, dict) else "")
+        or (data.get("pr_event_anchor") if isinstance(data, dict) else "")
+        or "created"
+    ).strip().lower()
+    if raw in {"closed", "closed_at", "close"}:
+        return "closed"
+    return "created"
+
+
+def pr_anchor_field(date_anchor: str) -> str:
+    return "closed_at" if date_anchor == "closed" else "created_at"
+
+
+def load_prs(year: int, month: int, date_anchor: str = "created") -> List[Dict]:
     path = consolidated_github_file(year, month)
     if not os.path.exists(path):
         print(f"ERROR: No consolidated data found at {path}")
         print(f"Run first:  python3 scripts/fetch-data.py github --month {year}-{month:02d}")
         sys.exit(1)
     data = read_json(path)
-    return data.get("pull_requests", [])
+    prs = data.get("pull_requests", [])
+    target_month = f"{year}-{month:02d}"
+    anchor_field = pr_anchor_field(date_anchor)
+    return [pr for pr in prs if str(pr.get(anchor_field) or "").startswith(target_month)]
 
 
 def load_internal_teams() -> Dict[str, List[str]]:
@@ -422,8 +442,9 @@ def all_jira_tickets() -> List[Dict]:
 
 
 def github_pr_split_stats(year: int, month: int) -> Optional[Dict[str, object]]:
+    date_anchor = load_pr_date_anchor()
     try:
-        prs = load_prs(year, month)
+        prs = load_prs(year, month, date_anchor=date_anchor)
     except SystemExit:
         return None
 

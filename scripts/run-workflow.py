@@ -143,6 +143,16 @@ def main() -> None:
     parser.add_argument("--skip-generate", action="store_true", help="Skip chart generation step")
     parser.add_argument("--force-fetch", action="store_true", help="Pass --force to fetch step")
     parser.add_argument("--setup-capabilities", default="1,2,3,4,5", help="Capabilities to run in setup step")
+    parser.add_argument(
+        "--github-date-anchor",
+        default="",
+        help="GitHub date anchor: created or closed (for PR heatmap + internal/external charts)",
+    )
+    parser.add_argument(
+        "--jira-date-anchor",
+        default="",
+        help="Jira date anchor: created or resolved (for service + requesting-team heatmaps)",
+    )
     args = parser.parse_args()
 
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -163,6 +173,10 @@ def main() -> None:
                 "--capabilities",
                 ",".join(setup_capabilities),
             ]
+            if args.github_date_anchor.strip():
+                setup_cmd.extend(["--github-date-anchor", args.github_date_anchor.strip()])
+            if args.jira_date_anchor.strip():
+                setup_cmd.extend(["--jira-date-anchor", args.jira_date_anchor.strip()])
             run_step("Setup", setup_cmd)
         else:
             print("\n=== Setup ===")

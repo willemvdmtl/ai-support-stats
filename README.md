@@ -57,6 +57,9 @@ User must provide:
 Used for:
 
 - Discovering owned repositories for PR data collection
+- Choosing PR chart basis (`created` or `closed`) for:
+	- PR Heatmap
+	- Internal vs External PRs
 
 ### Capability 2: GitHub internal team
 
@@ -99,6 +102,9 @@ User may need to provide (defaults are prefilled):
 Used for:
 
 - Team normalization and requesting-team heatmap enrichment
+- Choosing Jira heatmap basis (`created` or `resolved`) for:
+	- Service Heatmap
+	- Requesting Team Heatmap
 
 ## Main Commands
 
@@ -107,6 +113,7 @@ Full workflow (preferred):
 ```bash
 python3 scripts/run-workflow.py --month 2026-04
 python3 scripts/run-workflow.py --skip-setup --month 2026-04
+python3 scripts/run-workflow.py --month 2026-04 --github-date-anchor closed --jira-date-anchor resolved
 ```
 
 Setup only:
@@ -116,6 +123,8 @@ python3 scripts/setup.py
 python3 scripts/setup.py --list
 python3 scripts/setup.py --capabilities 1,2,3,4
 python3 scripts/setup.py --capabilities 2 --internal-teams "Ecommerce:user1,user2;Checkout:user3"
+python3 scripts/setup.py --capabilities 1,2 --github-date-anchor closed
+python3 scripts/setup.py --capabilities 3,4,5 --jira-date-anchor resolved
 ```
 
 Fetch only:

@@ -17,6 +17,7 @@ from common.setup_utils import read_json
 REPORTS_DIR = "reports"
 CONSOLIDATED_DIR = "cache/jira"
 CANONICAL_CREATED_DIR = "cache/jira/by-created"
+UPDATED_INDEX_DIR = "cache/jira/index-updated"
 TEAM_NORMALIZATION_FILE = "config/jira-team-normalization.json"
 ORG_STRUCTURE_FILE = "config/jira-org-structure.json"
 OVERRIDES_FILE = "config/jira-team-overrides.json"
@@ -28,12 +29,32 @@ DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
 ]
 
 
+def load_heatmap_date_anchor() -> str:
+    """Return heatmap date anchor from config; defaults to 'created'."""
+    data = _read_optional_json(JIRA_CONFIG_FILE)
+    raw = str(
+        (data.get("heatmap_date_anchor") if isinstance(data, dict) else "")
+        or (data.get("heatmap_event_anchor") if isinstance(data, dict) else "")
+        or "created"
+    ).strip().lower()
+
+    if raw in {"resolved", "resolution", "resolved_at", "resolutiondate"}:
+        return "resolved"
+    if raw in {"created", "creation", "created_at"}:
+        return "created"
+    return "created"
+
+
 def consolidated_file(year: int, month: int) -> str:
     return os.path.join(CONSOLIDATED_DIR, f"issues-{year}-{month:02d}.json")
 
 
 def canonical_created_file(year: int, month: int) -> str:
     return os.path.join(CANONICAL_CREATED_DIR, f"issues-{year}-{month:02d}.json")
+
+
+def updated_index_file(year: int, month: int) -> str:
+    return os.path.join(UPDATED_INDEX_DIR, f"updated-{year}-{month:02d}.json")
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -85,26 +106,80 @@ def is_vertical_support_ticket(ticket: Dict, issue_types: set, tags: set) -> boo
     return by_type or by_tag
 
 
-def load_tickets(year: int, month: int) -> List[Dict]:
-    path = canonical_created_file(year, month)
+def _ticket_anchor_field(date_anchor: str) -> str:
+    return "resolutiondate" if date_anchor == "resolved" else "created"
+
+
+def _updated_index_keys(year: int, month: int) -> set:
+    path = updated_index_file(year, month)
     if not os.path.exists(path):
-        path = consolidated_file(year, month)
-    if not os.path.exists(path):
-        print(f"ERROR: No consolidated Jira data found at {path}")
-        print(f"Run first:  python3 scripts/fetch-data.py jira --month {year}-{month:02d}")
-        sys.exit(1)
-    data = read_json(path)
-    issues = data.get("issues", [])
+        return set()
+    payload = read_json(path)
+    if isinstance(payload, dict):
+        issues = payload.get("issues", [])
+    elif isinstance(payload, list):
+        issues = payload
+    else:
+        issues = []
+
+    keys = set()
+    if isinstance(issues, list):
+        for item in issues:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _hydrate_issues_by_keys(keys: set) -> List[Dict]:
+    if not keys:
+        return []
+    scan_dir = CANONICAL_CREATED_DIR if os.path.exists(CANONICAL_CREATED_DIR) else CONSOLIDATED_DIR
+    if not os.path.exists(scan_dir):
+        return []
+
+    tickets_by_key: Dict[str, Dict] = {}
+    for name in sorted(os.listdir(scan_dir)):
+        if not name.startswith("issues-") or not name.endswith(".json"):
+            continue
+        path = os.path.join(scan_dir, name)
+        payload = read_json(path)
+        for ticket in payload.get("issues", []):
+            key = str(ticket.get("key") or "").strip()
+            if key and key in keys:
+                tickets_by_key[key] = ticket
+
+    return list(tickets_by_key.values())
+
+
+def load_tickets(year: int, month: int, date_anchor: str = "created") -> List[Dict]:
+    updated_keys = _updated_index_keys(year, month)
+    issues = _hydrate_issues_by_keys(updated_keys)
+
+    if not issues:
+        path = canonical_created_file(year, month)
+        if not os.path.exists(path):
+            path = consolidated_file(year, month)
+        if not os.path.exists(path):
+            print(f"ERROR: No consolidated Jira data found at {path}")
+            print(f"Run first:  python3 scripts/fetch-data.py jira --month {year}-{month:02d}")
+            sys.exit(1)
+        data = read_json(path)
+        issues = data.get("issues", [])
+
     issue_types, tags = load_vertical_support_filters()
     selected = issues
     if issue_types or tags:
         selected = [ticket for ticket in issues if is_vertical_support_ticket(ticket, issue_types, tags)]
 
     target_month = f"{year}-{month:02d}"
+    anchor_field = _ticket_anchor_field(date_anchor)
     return [
         ticket
         for ticket in selected
-        if str(ticket_fields(ticket).get("created") or "").startswith(target_month)
+        if str(ticket_fields(ticket).get(anchor_field) or "").startswith(target_month)
     ]
 
 
@@ -113,12 +188,12 @@ def ticket_fields(ticket: Dict) -> Dict:
     return fields if isinstance(fields, dict) else {}
 
 
-def ticket_created_day(ticket: Dict) -> Optional[int]:
-    created = ticket_fields(ticket).get("created", "")
-    if not created:
+def ticket_anchor_day(ticket: Dict, date_anchor: str) -> Optional[int]:
+    anchor_value = ticket_fields(ticket).get(_ticket_anchor_field(date_anchor), "")
+    if not anchor_value:
         return None
     try:
-        return dt.datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").day
+        return dt.datetime.strptime(anchor_value[:19], "%Y-%m-%dT%H:%M:%S").day
     except ValueError:
         return None
 
@@ -487,7 +562,7 @@ def normalize_service_name(raw: str, overrides: Dict[str, str], aliases: Dict[st
     return base.strip()
 
 
-def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dict:
+def derive_normalized_tickets(tickets: List[Dict], year: int, month: int, date_anchor: str = "created") -> Dict:
     team_config, org_config = load_team_configs()
     requesting_fields = team_config.get("requesting_team_fields") or []
     alias_map = _team_alias_map(team_config)
@@ -576,6 +651,8 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
             {
                 "key": ticket.get("key", ""),
                 "created_at": fields.get("created", ""),
+                "resolved_at": fields.get("resolutiondate", ""),
+                "anchor_at": fields.get(_ticket_anchor_field(date_anchor), ""),
                 "components": ticket_components(ticket),
                 "requesting_team_raw": deduped_values,
                 "requesting_team": normalized_display,
@@ -590,6 +667,7 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
     payload = {
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "month": f"{year}-{month:02d}",
+        "date_anchor": date_anchor,
         "ticket_count": len(normalized_tickets),
         "config_present": {
             "team_normalization": os.path.exists(TEAM_NORMALIZATION_FILE),
@@ -608,7 +686,7 @@ def derive_normalized_tickets(tickets: List[Dict], year: int, month: int) -> Dic
     return payload
 
 
-def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
+def generate_service_heatmap(tickets: List[Dict], year: int, month: int, date_anchor: str = "created") -> str:
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
@@ -632,7 +710,7 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
     source_label_count: Dict[str, int] = defaultdict(int)
 
     for ticket in tickets:
-        day = ticket_created_day(ticket)
+        day = ticket_anchor_day(ticket, date_anchor)
         if day is None or day > last_day:
             continue
         groups, source_label = ticket_basic_groups(ticket, DEFAULT_BASIC_GROUP_FIELDS)
@@ -648,6 +726,7 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
 
     ranked_sources = sorted(source_label_count.items(), key=lambda item: (-item[1], item[0].lower()))
     dominant_source = ranked_sources[0][0] if ranked_sources else "Component"
+    display_source = "Service" if dominant_source == "Description Repo" else dominant_source
     source_summary = ", ".join(f"{name}={count}" for name, count in ranked_sources)
     if source_summary:
         print(f"  Basic axis source usage: {source_summary}")
@@ -753,9 +832,9 @@ def generate_service_heatmap(tickets: List[Dict], year: int, month: int) -> str:
         if label.get_text() == "Total":
             label.set_fontweight("bold")
 
-    plt.title(f"Jira Tickets by {dominant_source} - {month_name}", fontsize=14, fontweight="bold", pad=16)
+    plt.title(f"Jira Tickets by {display_source} - {month_name}", fontsize=14, fontweight="bold", pad=16)
     plt.xlabel("Day of month", fontsize=11, fontweight="bold")
-    plt.ylabel(dominant_source, fontsize=11, fontweight="bold")
+    plt.ylabel(display_source, fontsize=11, fontweight="bold")
     plt.tight_layout()
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -791,11 +870,11 @@ def generate_team_heatmap(derived_payload: Dict, year: int, month: int) -> str:
     raw_tickets = 0
 
     for ticket in derived_payload.get("tickets", []):
-        created_at = ticket.get("created_at", "")
-        if not created_at:
+        anchor_at = ticket.get("anchor_at") or ticket.get("created_at", "")
+        if not anchor_at:
             continue
         try:
-            day = dt.datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S").day
+            day = dt.datetime.strptime(anchor_at[:19], "%Y-%m-%dT%H:%M:%S").day
         except ValueError:
             continue
         if day > last_day:
@@ -963,17 +1042,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     month_name = dt.date(year, month, 1).strftime("%B %Y")
 
     print(f"Generating Jira ticket charts for {month_name}...")
-    tickets = load_tickets(year, month)
+    date_anchor = load_heatmap_date_anchor()
+    print(f"Date anchor: {date_anchor}")
+    tickets = load_tickets(year, month, date_anchor=date_anchor)
     print(f"Loaded {len(tickets)} ticket(s)")
 
-    derived_payload = derive_normalized_tickets(tickets, year, month)
+    derived_payload = derive_normalized_tickets(tickets, year, month, date_anchor=date_anchor)
 
     do_service = not args.team_only
     do_team = not args.service_only
 
     if do_service:
         print("\nService heatmap:")
-        out = generate_service_heatmap(tickets, year, month)
+        out = generate_service_heatmap(tickets, year, month, date_anchor=date_anchor)
         if out:
             print(f"  Saved: {out}")
 
