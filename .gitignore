@@ -4,6 +4,7 @@ config
 reports
 .vscode
 .venv
+.DS_Store
 !config/jira-team-normalization.json
 !config/jira-team-overrides.json
 !reports/sample_chart_github_prs.png
