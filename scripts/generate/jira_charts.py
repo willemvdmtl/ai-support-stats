@@ -4,7 +4,9 @@
 import argparse
 import calendar
 import datetime as dt
+import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -27,6 +29,8 @@ JIRA_CONFIG_FILE = "config/jira-minimal.json"
 DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
     ("customfield_16011", "Service Name"),
 ]
+METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
+OUTLIER_IQR_MULTIPLIER = 5.0
 
 
 def load_heatmap_date_anchor() -> str:
@@ -289,6 +293,1127 @@ def _flatten_values(value: object) -> List[str]:
 
 def _read_optional_json(path: str) -> Dict:
     return read_json(path) if os.path.exists(path) else {}
+
+
+def _normalize_values(values: List[str]) -> set:
+    normalized = set()
+    for raw in values or []:
+        cleaned = str(raw).strip().lower()
+        if cleaned:
+            normalized.add(cleaned)
+    return normalized
+
+
+def _normalize_filter(raw_filter: object) -> Dict[str, set]:
+    if not isinstance(raw_filter, dict):
+        return {"issue_types": set(), "labels": set()}
+    return {
+        "issue_types": _normalize_values(raw_filter.get("issue_types") or []),
+        "labels": _normalize_values(raw_filter.get("labels") or []),
+    }
+
+
+def _normalize_window_policy(raw: object, default_raw: Dict[str, object]) -> Dict[str, object]:
+    policy = dict(default_raw)
+    if isinstance(raw, dict):
+        policy.update(raw)
+
+    mode = str(policy.get("mode") or "auto").strip().lower()
+    if mode not in {"auto", "month_to_date", "full_month", "rolling"}:
+        mode = "auto"
+    rolling_days = int(policy.get("rolling_days_if_month_data_lt_days") or 14)
+    if rolling_days < 1:
+        rolling_days = 14
+    month_when_ready = str(policy.get("month_window_type_if_ready") or "month_to_date").strip().lower()
+    if month_when_ready not in {"month_to_date", "full_month"}:
+        month_when_ready = "month_to_date"
+
+    return {
+        "mode": mode,
+        "rolling_days_if_month_data_lt_days": rolling_days,
+        "month_window_type_if_ready": month_when_ready,
+    }
+
+
+def load_metric_groups_policy() -> Dict[str, object]:
+    raw = _read_optional_json(METRIC_GROUPS_CONFIG_FILE)
+    if not isinstance(raw, dict):
+        raw = {}
+
+    defaults_raw = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
+    validity_raw = defaults_raw.get("validity") if isinstance(defaults_raw.get("validity"), dict) else {}
+    validity = {
+        "require_created": bool(validity_raw.get("require_created", True)),
+        "require_resolved": bool(validity_raw.get("require_resolved", True)),
+        "exclude_negative_durations": bool(validity_raw.get("exclude_negative_durations", True)),
+    }
+
+    default_window = _normalize_window_policy(defaults_raw.get("window_policy"), {
+        "mode": "auto",
+        "rolling_days_if_month_data_lt_days": 14,
+        "month_window_type_if_ready": "month_to_date",
+    })
+
+    groups: List[Dict[str, object]] = []
+    for idx, group in enumerate(raw.get("groups") or []):
+        if not isinstance(group, dict):
+            continue
+        label = str(group.get("label") or "").strip() or f"Group {idx + 1}"
+        group_filter = group.get("filter") if isinstance(group.get("filter"), dict) else {}
+        groups.append(
+            {
+                "id": str(group.get("id") or f"group_{idx + 1}").strip(),
+                "label": label,
+                "include_any": _normalize_filter(group_filter.get("include_any")),
+                "exclude_any": _normalize_filter(group_filter.get("exclude_any")),
+                "force_include_any": _normalize_filter(group_filter.get("force_include_any")),
+                "window_policy": _normalize_window_policy(group.get("window_policy"), default_window),
+            }
+        )
+
+    return {
+        "validity": validity,
+        "groups": groups,
+    }
+
+
+def _filter_is_empty(filter_spec: Dict[str, set]) -> bool:
+    return not filter_spec.get("issue_types") and not filter_spec.get("labels")
+
+
+def _ticket_matches_filter(ticket: Dict, filter_spec: Dict[str, set]) -> bool:
+    issue_types = filter_spec.get("issue_types") or set()
+    labels = filter_spec.get("labels") or set()
+    by_type = bool(issue_types) and ticket_issue_type(ticket).lower() in issue_types
+    by_label = bool(labels) and bool(ticket_labels(ticket) & labels)
+    return by_type or by_label
+
+
+def select_group_tickets(all_tickets: List[Dict], group: Dict[str, object]) -> List[Dict]:
+    include_any = group.get("include_any") if isinstance(group.get("include_any"), dict) else {"issue_types": set(), "labels": set()}
+    exclude_any = group.get("exclude_any") if isinstance(group.get("exclude_any"), dict) else {"issue_types": set(), "labels": set()}
+    force_include_any = group.get("force_include_any") if isinstance(group.get("force_include_any"), dict) else {"issue_types": set(), "labels": set()}
+
+    selected: Dict[str, Dict] = {}
+    for ticket in all_tickets:
+        if not _filter_is_empty(include_any) and not _ticket_matches_filter(ticket, include_any):
+            continue
+        if not _filter_is_empty(exclude_any) and _ticket_matches_filter(ticket, exclude_any):
+            continue
+        key = str(ticket.get("key") or "")
+        if key:
+            selected[key] = ticket
+
+    if not _filter_is_empty(force_include_any):
+        for ticket in all_tickets:
+            if not _ticket_matches_filter(ticket, force_include_any):
+                continue
+            key = str(ticket.get("key") or "")
+            if key:
+                selected[key] = ticket
+
+    return list(selected.values())
+
+
+def parse_jira_datetime(raw: str) -> Optional[dt.datetime]:
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalized_resolution_name(ticket: Dict) -> str:
+    fields = ticket_fields(ticket)
+    resolution = fields.get("resolution") if isinstance(fields.get("resolution"), dict) else {}
+    normalized = str(resolution.get("name") or "").strip().lower().replace("'", "")
+    return " ".join(normalized.split())
+
+
+def _is_cycle_start_status(status_name: str) -> bool:
+    name = status_name.strip().lower()
+    if not name:
+        return False
+    if name in {"in progress", "in development", "development in progress", "doing"}:
+        return True
+    return "in progress" in name
+
+
+def _is_cycle_fallback_review_status(status_name: str) -> bool:
+    return status_name.strip().lower() == "in review"
+
+
+def _first_in_progress_transition_at(ticket: Dict) -> Optional[dt.datetime]:
+    changelog = ticket.get("changelog") if isinstance(ticket.get("changelog"), dict) else {}
+    histories = changelog.get("histories") if isinstance(changelog.get("histories"), list) else []
+
+    transition_times: List[dt.datetime] = []
+    fallback_review_times: List[dt.datetime] = []
+    for history in histories:
+        if not isinstance(history, dict):
+            continue
+        changed_at = parse_jira_datetime(str(history.get("created") or ""))
+        if changed_at is None:
+            continue
+        items = history.get("items") if isinstance(history.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("field") or "").strip().lower() != "status":
+                continue
+            to_status = str(item.get("toString") or "")
+            if _is_cycle_start_status(to_status):
+                transition_times.append(changed_at)
+                break
+            if _is_cycle_fallback_review_status(to_status):
+                fallback_review_times.append(changed_at)
+                break
+
+    if transition_times:
+        return min(transition_times)
+    if fallback_review_times:
+        return min(fallback_review_times)
+    return None
+
+
+def _month_window(year: int, month: int) -> Tuple[dt.datetime, dt.datetime]:
+    month_start = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
+    if month == 12:
+        month_end = dt.datetime(year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    else:
+        month_end = dt.datetime(year, month + 1, 1, tzinfo=dt.timezone.utc)
+    return month_start, month_end
+
+
+def _month_to_date_window(year: int, month: int) -> Tuple[dt.datetime, dt.datetime]:
+    month_start, month_end = _month_window(year, month)
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    return month_start, min(now_utc, month_end)
+
+
+def _rolling_window(year: int, month: int, days: int) -> Tuple[dt.datetime, dt.datetime]:
+    _, month_end = _month_window(year, month)
+    today_utc = dt.datetime.now(dt.timezone.utc)
+    window_end = min(today_utc, month_end)
+    window_start = window_end - dt.timedelta(days=days)
+    return window_start, window_end
+
+
+def resolve_window(year: int, month: int, policy: Dict[str, object]) -> Tuple[dt.datetime, dt.datetime]:
+    mode = str(policy.get("mode") or "auto")
+    rolling_days = int(policy.get("rolling_days_if_month_data_lt_days") or 14)
+    month_when_ready = str(policy.get("month_window_type_if_ready") or "month_to_date")
+
+    if mode == "rolling":
+        return _rolling_window(year, month, rolling_days)
+    if mode == "full_month":
+        return _month_window(year, month)
+    if mode == "month_to_date":
+        return _month_to_date_window(year, month)
+
+    window_start, window_end = _month_to_date_window(year, month)
+    if window_end <= window_start:
+        return window_start, window_end
+    elapsed_days = (window_end - window_start).total_seconds() / 86400.0
+    if elapsed_days < float(rolling_days):
+        return _rolling_window(year, month, rolling_days)
+    if month_when_ready == "full_month":
+        return _month_window(year, month)
+    return window_start, window_end
+
+
+def jira_lead_stats_in_window(
+    tickets: List[Dict],
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    validity: Dict[str, bool],
+) -> List[float]:
+    durations_days: List[float] = []
+    for ticket in tickets:
+        fields = ticket_fields(ticket)
+        created = parse_jira_datetime(str(fields.get("created") or ""))
+        if created is None and validity.get("require_created", True):
+            continue
+        if created is None:
+            continue
+
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if resolution is None and validity.get("require_resolved", True):
+            continue
+        if resolution is None:
+            continue
+
+        resolution_utc = resolution.astimezone(dt.timezone.utc)
+        if not (window_start <= resolution_utc < window_end):
+            continue
+
+        delta = (resolution - created).total_seconds()
+        if delta < 0 and validity.get("exclude_negative_durations", True):
+            continue
+        durations_days.append(delta / 86400.0)
+
+    return durations_days
+
+
+def jira_lead_durations_by_ticket_in_window(
+    tickets: List[Dict],
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    validity: Dict[str, bool],
+) -> List[Tuple[Dict, float]]:
+    durations: List[Tuple[Dict, float]] = []
+    for ticket in tickets:
+        fields = ticket_fields(ticket)
+        created = parse_jira_datetime(str(fields.get("created") or ""))
+        if created is None and validity.get("require_created", True):
+            continue
+        if created is None:
+            continue
+
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if resolution is None and validity.get("require_resolved", True):
+            continue
+        if resolution is None:
+            continue
+
+        resolution_utc = resolution.astimezone(dt.timezone.utc)
+        if not (window_start <= resolution_utc < window_end):
+            continue
+
+        delta = (resolution - created).total_seconds()
+        if delta < 0 and validity.get("exclude_negative_durations", True):
+            continue
+
+        durations.append((ticket, delta / 86400.0))
+
+    return durations
+
+
+def jira_cycle_stats_in_window(
+    tickets: List[Dict],
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    validity: Dict[str, bool],
+) -> List[float]:
+    durations_days: List[float] = []
+    for ticket in tickets:
+        fields = ticket_fields(ticket)
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if resolution is None and validity.get("require_resolved", True):
+            continue
+        if resolution is None:
+            continue
+
+        resolution_utc = resolution.astimezone(dt.timezone.utc)
+        if not (window_start <= resolution_utc < window_end):
+            continue
+
+        cycle_start = _first_in_progress_transition_at(ticket)
+        if cycle_start is None:
+            continue
+
+        delta = (resolution - cycle_start).total_seconds()
+        if delta < 0 and validity.get("exclude_negative_durations", True):
+            continue
+        durations_days.append(delta / 86400.0)
+
+    return durations_days
+
+
+def percentile(sorted_values: List[float], percent: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+
+    rank = (len(sorted_values) - 1) * (percent / 100.0)
+    lower_idx = int(math.floor(rank))
+    upper_idx = int(math.ceil(rank))
+    if lower_idx == upper_idx:
+        return float(sorted_values[lower_idx])
+
+    weight = rank - lower_idx
+    lower_val = float(sorted_values[lower_idx])
+    upper_val = float(sorted_values[upper_idx])
+    return lower_val + (upper_val - lower_val) * weight
+
+
+def filter_iqr_outliers(values: List[float]) -> List[float]:
+    if len(values) < 4:
+        return list(values)
+
+    ordered = sorted(float(v) for v in values)
+    q1 = percentile(ordered, 25)
+    q3 = percentile(ordered, 75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return list(values)
+
+    upper = q3 + OUTLIER_IQR_MULTIPLIER * iqr
+    filtered = [float(v) for v in values if float(v) <= upper]
+    return filtered if filtered else list(values)
+
+
+def filter_iqr_outlier_pairs(values: List[Tuple[Dict, float]]) -> List[Tuple[Dict, float]]:
+    if len(values) < 4:
+        return list(values)
+
+    ordered = sorted(float(v) for _, v in values)
+    q1 = percentile(ordered, 25)
+    q3 = percentile(ordered, 75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return list(values)
+
+    upper = q3 + OUTLIER_IQR_MULTIPLIER * iqr
+    filtered = [(ticket, float(v)) for ticket, v in values if float(v) <= upper]
+    return filtered if filtered else list(values)
+
+
+def _avg_or_none(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _normalize_group_key(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _find_metric_group(groups: List[Dict[str, object]], target_id: str, target_label: str) -> Optional[Dict[str, object]]:
+    wanted_id = _normalize_group_key(target_id)
+    wanted_label = _normalize_group_key(target_label)
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = _normalize_group_key(str(group.get("id") or ""))
+        label = _normalize_group_key(str(group.get("label") or ""))
+        if group_id == wanted_id or label == wanted_label:
+            return group
+    return None
+
+
+def _apply_ktlo_exclusions(tickets: List[Dict]) -> List[Dict]:
+    excluded_resolutions = {"wont do", "duplicate"}
+    return [
+        ticket
+        for ticket in tickets
+        if normalized_resolution_name(ticket) not in excluded_resolutions
+        and ticket_issue_type(ticket).strip().lower() not in {"epic", "sub-task", "subtask"}
+    ]
+
+
+def _shift_month(year: int, month: int, offset: int) -> Tuple[int, int]:
+    base = dt.date(year, month, 1)
+    idx = base.year * 12 + (base.month - 1) + offset
+    shifted_year = idx // 12
+    shifted_month = (idx % 12) + 1
+    return shifted_year, shifted_month
+
+
+def _month_sequence(year: int, month: int, count: int) -> List[Tuple[int, int]]:
+    return [_shift_month(year, month, -(count - 1) + i) for i in range(count)]
+
+
+def all_jira_tickets() -> List[Dict]:
+    scan_dir = CANONICAL_CREATED_DIR if os.path.exists(CANONICAL_CREATED_DIR) else CONSOLIDATED_DIR
+    if not os.path.exists(scan_dir):
+        return []
+
+    tickets_by_key: Dict[str, Dict] = {}
+    for name in sorted(os.listdir(scan_dir)):
+        if not name.startswith("issues-") or not name.endswith(".json"):
+            continue
+        path = os.path.join(scan_dir, name)
+        payload = read_json(path)
+        for ticket in payload.get("issues", []):
+            key = str(ticket.get("key") or "")
+            if key:
+                tickets_by_key[key] = ticket
+    return list(tickets_by_key.values())
+
+
+_POSITIVE_RESOLUTIONS_EXCLUDED = {"wont do", "won't do", "duplicate"}
+_ECOMMERCE_TEAM_FIELD = "customfield_22934"
+_ECOMMERCE_TEAM_EXCLUDED = {"feature"}
+_PR_SIZE_FIELD = "customfield_22936"
+_PR_SIZE_ORDER = ("XS", "S", "M", "L", "XL")
+_PR_SIZE_MAP = {
+    "EXTRA SMALL": "XS",
+    "XSMALL": "XS",
+    "XS": "XS",
+    "SMALL": "S",
+    "S": "S",
+    "MEDIUM": "M",
+    "M": "M",
+    "LARGE": "L",
+    "L": "L",
+    "EXTRA LARGE": "XL",
+    "XLARGE": "XL",
+    "XL": "XL",
+}
+_PRIORITY_LEVELS = ("Critical", "High", "Medium", "Low")
+_ISSUE_TYPE_COLOR_MAP = {
+    "pr": "#1f77b4",
+    "pr request": "#1f77b4",
+    "pull request": "#1f77b4",
+    "story": "#ff7f0e",
+    "task": "#2ca02c",
+    "incident": "#d62728",
+    "spike": "#9467bd",
+    "defect": "#8c564b",
+    "tech improvement": "#e377c2",
+    "sub-task": "#7f7f7f",
+    "subtask": "#7f7f7f",
+    "other": "#17becf",
+}
+_ISSUE_TYPE_FALLBACK_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+
+def _is_positive_resolution(ticket: Dict) -> bool:
+    """Return True if the ticket was resolved positively (not Won't Do or Duplicate)."""
+    return normalized_resolution_name(ticket) not in _POSITIVE_RESOLUTIONS_EXCLUDED
+
+
+def _is_excluded_ecommerce_team(ticket: Dict) -> bool:
+    """Return True when ECommerce Team is set to a value we explicitly exclude."""
+    fields = ticket_fields(ticket)
+    raw = fields.get(_ECOMMERCE_TEAM_FIELD)
+
+    value = ""
+    if isinstance(raw, dict):
+        value = str(raw.get("value") or raw.get("name") or raw.get("displayName") or "").strip().lower()
+    elif isinstance(raw, str):
+        value = raw.strip().lower()
+
+    return value in _ECOMMERCE_TEAM_EXCLUDED
+
+
+def _is_excluded_assignee(ticket: Dict) -> bool:
+    """Return True when ticket assignee should be excluded from charting."""
+    fields = ticket_fields(ticket)
+    assignee = fields.get("assignee")
+    if not isinstance(assignee, dict):
+        return False
+
+    name = str(assignee.get("displayName") or assignee.get("name") or "").strip().lower()
+    if not name:
+        return False
+
+    return ("willem" in name) or name == "em" or name.startswith("em ") or name.endswith(" em")
+
+
+def _pr_size_bucket(ticket: Dict) -> str:
+    """Normalize PR size value from Jira custom field to XS/S/M/L/XL or empty string."""
+    fields = ticket_fields(ticket)
+    raw = fields.get(_PR_SIZE_FIELD)
+
+    value = ""
+    if isinstance(raw, dict):
+        value = str(raw.get("value") or raw.get("name") or raw.get("displayName") or "").strip().upper()
+    elif isinstance(raw, str):
+        value = raw.strip().upper()
+
+    return _PR_SIZE_MAP.get(value, "")
+
+
+def _priority_bucket(ticket: Dict) -> str:
+    """Normalize Jira priority to Critical/High/Medium/Low or empty string."""
+    fields = ticket_fields(ticket)
+    raw = fields.get("priority")
+
+    value = ""
+    if isinstance(raw, dict):
+        value = str(raw.get("name") or raw.get("value") or "").strip().lower()
+    elif isinstance(raw, str):
+        value = raw.strip().lower()
+
+    if value in {"critical", "highest", "blocker"}:
+        return "Critical"
+    if value in {"high", "major"}:
+        return "High"
+    if value in {"medium", "normal"}:
+        return "Medium"
+    if value in {"low", "minor", "lowest", "trivial"}:
+        return "Low"
+    return ""
+
+
+def _priority_icon_url(ticket: Dict) -> str:
+    """Return Jira priority icon URL, if present."""
+    fields = ticket_fields(ticket)
+    raw = fields.get("priority")
+    if isinstance(raw, dict):
+        url = str(raw.get("iconUrl") or "").strip()
+        if url:
+            return url
+    bucket = _priority_bucket(ticket)
+    fallback = {
+        "Critical": "https://trainline.atlassian.net/images/icons/priorities/critical.svg",
+        "High": "https://trainline.atlassian.net/images/icons/priorities/major.svg",
+        "Medium": "https://trainline.atlassian.net/images/icons/priorities/medium.svg",
+        "Low": "https://trainline.atlassian.net/images/icons/priorities/minor.svg",
+    }
+    if bucket in fallback:
+        return fallback[bucket]
+    return ""
+
+
+def _issue_type_color(label: str) -> str:
+    key = str(label or "").strip().lower()
+    if key in _ISSUE_TYPE_COLOR_MAP:
+        return _ISSUE_TYPE_COLOR_MAP[key]
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    idx = int(digest[:8], 16) % len(_ISSUE_TYPE_FALLBACK_PALETTE)
+    return _ISSUE_TYPE_FALLBACK_PALETTE[idx]
+
+
+def _vs_issue_type_group(ticket: Dict) -> str:
+    """Classify a Vertical Support ticket into one of four display groups."""
+    t = ticket_issue_type(ticket).strip().lower()
+    if t in {"pr request", "pull request", "pr", "externalrequest", "external request"}:
+        return "PR"
+    if t == "spike":
+        return "Spike"
+    if t == "defect":
+        return "Defect"
+    return "Other"
+
+
+def _plot_flow_trend_group(ax, x, labels, lead_all, lead_filt, cycle_all, cycle_filt):
+    """Plot lead/cycle all vs filtered on a single axes with distinct colors and styles."""
+    # Lead: blue shades. Cycle: green shades. All: solid+filled. Filtered: dashed+open marker.
+    ax.plot(x, lead_all,   color="#1f77b4", linewidth=2.5, marker="o", markersize=7,
+            linestyle="-",  label="Lead time (all)")
+    ax.plot(x, lead_filt,  color="#6baed6", linewidth=2,   marker="o", markersize=7,
+            linestyle="--", dashes=(6, 3), label="Lead time (excl outliers)")
+    ax.plot(x, cycle_all,  color="#2ca02c", linewidth=2.5, marker="s", markersize=7,
+            linestyle="-",  label="Cycle time (all)")
+    ax.plot(x, cycle_filt, color="#74c476", linewidth=2,   marker="s", markersize=7,
+            linestyle="--", dashes=(6, 3), label="Cycle time (excl outliers)")
+    ax.set_ylabel("Days")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.grid(alpha=0.25, linestyle=":")
+    ax.legend(loc="upper left", ncol=2, fontsize=9)
+
+
+def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -> str:
+    import matplotlib.pyplot as plt
+    import matplotlib.image as mpimg
+    from io import BytesIO
+    from urllib.parse import urlparse
+    from urllib.request import urlopen
+    from matplotlib.offsetbox import AnnotationBbox, OffsetImage
+
+    policy = load_metric_groups_policy()
+    groups = policy.get("groups") if isinstance(policy.get("groups"), list) else []
+    validity = policy.get("validity") if isinstance(policy.get("validity"), dict) else {}
+    all_tickets = all_jira_tickets()
+
+    vertical_group = _find_metric_group(groups, "vertical_support", "Vertical Support")
+    ktlo_group = _find_metric_group(groups, "ktlo", "KTLO")
+    if vertical_group is None or ktlo_group is None:
+        print("  Missing Vertical Support or KTLO metric group. Skipping flow trend chart.")
+        return ""
+
+    months = _month_sequence(year, month, lookback_months)
+    labels = [dt.date(y, m, 1).strftime("%b %Y") for y, m in months]
+    x = list(range(len(months)))
+
+    # VS: PR reviews split by PR size (XS→XL)
+    vs_size_avg: Dict[str, List[Optional[float]]] = {s: [] for s in _PR_SIZE_ORDER}
+    vs_size_counts: Dict[str, List[int]] = {s: [] for s in _PR_SIZE_ORDER}
+    vs_month_assignee_counts: List[int] = []
+    vs_month_ticket_totals: List[int] = []
+    vs_individual_by_month: List[Dict[str, List[Dict[str, object]]]] = []
+    vs_individual_outliers_excluded = 0
+
+    # KTLO: lead by ticket type (all and filtered)
+    ktlo_issue_types: set = set()
+    ktlo_month_groups: List[Tuple[dt.datetime, dt.datetime, Dict[str, List[Dict]]]] = []
+    ktlo_month_ticket_counts: List[int] = []
+    ktlo_month_assignee_counts: List[int] = []
+
+    for y, m in months:
+        v_window = vertical_group.get("window_policy") if isinstance(vertical_group.get("window_policy"), dict) else {}
+        k_window = ktlo_group.get("window_policy") if isinstance(ktlo_group.get("window_policy"), dict) else {}
+        v_start, v_end = resolve_window(y, m, v_window)
+        k_start, k_end = resolve_window(y, m, k_window)
+
+        # Vertical Support: positively resolved PR tickets only, excluding ECommerce Team=Feature.
+        vs_tickets = [
+            t for t in select_group_tickets(all_tickets, vertical_group)
+            if _is_positive_resolution(t) and not _is_excluded_ecommerce_team(t)
+        ]
+        vs_pr_tickets = [t for t in vs_tickets if _vs_issue_type_group(t) == "PR"]
+
+        month_pr_tickets: List[Dict] = []
+        month_assignees: set = set()
+        for t in vs_pr_tickets:
+            fields = ticket_fields(t)
+            resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+            if resolution is None:
+                continue
+            resolution_utc = resolution.astimezone(dt.timezone.utc)
+            if not (v_start <= resolution_utc < v_end):
+                continue
+            month_pr_tickets.append(t)
+
+            assignee = fields.get("assignee")
+            if isinstance(assignee, dict):
+                aid = assignee.get("accountId") or assignee.get("name") or assignee.get("displayName")
+                if aid:
+                    month_assignees.add(aid)
+
+        vs_month_assignee_counts.append(len(month_assignees))
+        vs_month_ticket_totals.append(len(month_pr_tickets))
+        month_size_points: Dict[str, List[Dict[str, object]]] = {s: [] for s in _PR_SIZE_ORDER}
+
+        for size in _PR_SIZE_ORDER:
+            size_tickets = [t for t in month_pr_tickets if _pr_size_bucket(t) == size]
+            lead_pairs = jira_lead_durations_by_ticket_in_window(size_tickets, v_start, v_end, validity)
+            filtered_pairs = filter_iqr_outlier_pairs(lead_pairs)
+            lead_filtered = [days for _, days in filtered_pairs]
+            vs_individual_outliers_excluded += max(0, len(lead_pairs) - len(filtered_pairs))
+            vs_size_avg[size].append(_avg_or_none(lead_filtered))
+            vs_size_counts[size].append(len(lead_filtered))
+            month_size_points[size] = [
+                {
+                    "lead_days": days,
+                    "priority": _priority_bucket(ticket),
+                    "priority_icon_url": _priority_icon_url(ticket),
+                }
+                for ticket, days in sorted(filtered_pairs, key=lambda item: float(item[1]))
+            ]
+
+        vs_individual_by_month.append(month_size_points)
+
+        # KTLO: positively resolved tickets only, excluding ECommerce Team=Feature and excluded assignees.
+        ktlo_tickets = [
+            t for t in _apply_ktlo_exclusions(select_group_tickets(all_tickets, ktlo_group))
+            if _is_positive_resolution(t)
+            and not _is_excluded_ecommerce_team(t)
+            and not _is_excluded_assignee(t)
+        ]
+
+        # Build month-scoped ticket list + assignee set for compact axis annotation.
+        month_tickets: List[Dict] = []
+        month_assignee_ids: set = set()
+        for t in ktlo_tickets:
+            fields = ticket_fields(t)
+            resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+            if resolution is None:
+                continue
+            resolution_utc = resolution.astimezone(dt.timezone.utc)
+            if not (k_start <= resolution_utc < k_end):
+                continue
+            month_tickets.append(t)
+            assignee = fields.get("assignee")
+            if isinstance(assignee, dict):
+                aid = assignee.get("accountId") or assignee.get("name") or assignee.get("displayName")
+                if aid:
+                    month_assignee_ids.add(aid)
+
+        ktlo_month_ticket_counts.append(len(month_tickets))
+        ktlo_month_assignee_counts.append(len(month_assignee_ids))
+
+        grouped: Dict[str, List[Dict]] = {}
+        for t in month_tickets:
+            issue_type = ticket_issue_type(t) or "Unspecified"
+            grouped.setdefault(issue_type, []).append(t)
+            ktlo_issue_types.add(issue_type)
+        ktlo_month_groups.append((k_start, k_end, grouped))
+
+    sorted_ktlo_types = sorted(ktlo_issue_types)
+    ktlo_series_all: Dict[str, List[Optional[float]]] = {t: [] for t in sorted_ktlo_types}
+    ktlo_series_filtered: Dict[str, List[Optional[float]]] = {t: [] for t in sorted_ktlo_types}
+    ktlo_type_totals: Dict[str, int] = {t: 0 for t in sorted_ktlo_types}
+
+    for k_start, k_end, grouped in ktlo_month_groups:
+        for issue_type in sorted_ktlo_types:
+            type_tickets = grouped.get(issue_type, [])
+            lead = jira_lead_stats_in_window(type_tickets, k_start, k_end, validity)
+            ktlo_series_all[issue_type].append(_avg_or_none(lead))
+            ktlo_series_filtered[issue_type].append(_avg_or_none(filter_iqr_outliers(lead)))
+            ktlo_type_totals[issue_type] += len(lead)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    out_vs = os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_{year}_{month:02d}.png")
+    out_vs_individual = os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_individual_{year}_{month:02d}.png")
+    out_ktlo = os.path.join(REPORTS_DIR, f"jira_flow_trend_ktlo_{year}_{month:02d}.png")
+
+    # --- Vertical Support chart: average lead time bars by PR size ---
+    fig_vs, ax_vs = plt.subplots(figsize=(13, 5))
+    group_centers = x
+    bar_widths = [0.10, 0.13, 0.16, 0.19, 0.22]  # XS -> XL (increasing width)
+    width_total = sum(bar_widths)
+    offsets: List[float] = []
+    cursor = -width_total / 2.0
+    for w in bar_widths:
+        offsets.append(cursor + (w / 2.0))
+        cursor += w
+
+    size_colors = {
+        "XS": "#6baed6",
+        "S": "#4292c6",
+        "M": "#2171b5",
+        "L": "#08519c",
+        "XL": "#08306b",
+    }
+
+    max_bar_value = 0.0
+    for idx, size in enumerate(_PR_SIZE_ORDER):
+        xpos = [c + offsets[idx] for c in group_centers]
+        yvals = [v if v is not None else 0.0 for v in vs_size_avg[size]]
+        bars = ax_vs.bar(
+            xpos,
+            yvals,
+            width=bar_widths[idx],
+            color=size_colors.get(size, _issue_type_color(size)),
+            alpha=0.85,
+            label=size,
+        )
+
+        for bar, count in zip(bars, vs_size_counts[size]):
+            ax_vs.annotate(
+                size,
+                xy=(bar.get_x() + bar.get_width() / 2.0, 0),
+                xytext=(0, 2),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                color="#333333",
+                clip_on=False,
+            )
+            if count > 0:
+                h = bar.get_height()
+                max_bar_value = max(max_bar_value, h)
+                ax_vs.annotate(
+                    str(count),
+                    xy=(bar.get_x() + bar.get_width() / 2.0, h),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    color="#333333",
+                )
+
+    assignee_label_y = max(12, max_bar_value * 1.15)
+    for month_x, dev_count, total_count in zip(group_centers, vs_month_assignee_counts, vs_month_ticket_totals):
+        ax_vs.annotate(
+            f"{total_count} tickets | {dev_count} devs",
+            xy=(month_x, assignee_label_y),
+            xytext=(0, 2),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#444444",
+        )
+    ax_vs.set_ylabel("Days")
+    _, vs_top = ax_vs.get_ylim()
+    ax_vs.set_ylim(bottom=0, top=max(12, assignee_label_y * 1.10))
+    ax_vs.set_xticks(x)
+    ax_vs.set_xticklabels(labels, rotation=0, ha="center")
+    ax_vs.tick_params(axis="x", pad=8)
+    ax_vs.grid(alpha=0.25, linestyle=":")
+    ax_vs.set_title("Lead Time - PR Reviews", fontsize=12, fontweight="bold")
+    fig_vs.tight_layout()
+    fig_vs.subplots_adjust(bottom=0.16)
+    fig_vs.savefig(out_vs, dpi=200, bbox_inches="tight")
+    plt.close(fig_vs)
+
+    # --- Vertical Support chart: one bar per PR ticket (month sections; size-group sorting) ---
+    total_pr_count = sum(sum(len(month_data.get(s, [])) for s in _PR_SIZE_ORDER) for month_data in vs_individual_by_month)
+    individual_width = 13.0
+    fig_vs_individual, ax_vs_individual = plt.subplots(figsize=(individual_width, 5))
+
+    if total_pr_count > 0:
+        xpos: List[float] = []
+        yvals: List[float] = []
+        colors: List[str] = []
+        priorities: List[str] = []
+        priority_icon_urls: List[str] = []
+        group_annotations: List[Tuple[float, str]] = []
+        month_tick_positions: List[float] = []
+        month_count_annotations: List[Tuple[float, int, int]] = []
+        month_boundaries: List[float] = []
+        size_bar_widths = {"XS": 0.40, "S": 0.56, "M": 0.74, "L": 0.94, "XL": 1.17}
+
+        cursor = 0.0
+        month_gap = 2.0
+        for month_idx, month_data in enumerate(vs_individual_by_month):
+            month_start = cursor
+
+            for size in _PR_SIZE_ORDER:
+                points = month_data.get(size, [])
+                if not points:
+                    continue
+
+                bar_w = float(size_bar_widths.get(size, 0.88))
+                group_start = cursor
+                for point in points:
+                    lead_days = float(point.get("lead_days") or 0.0)
+                    xpos.append(cursor + (bar_w / 2.0))
+                    yvals.append(lead_days)
+                    colors.append(size_colors.get(size, "#4c78a8"))
+                    priorities.append(str(point.get("priority") or ""))
+                    priority_icon_urls.append(str(point.get("priority_icon_url") or ""))
+                    cursor += bar_w
+                group_end = cursor
+                group_annotations.append(((group_start + group_end) / 2.0, size))
+
+            if cursor > month_start:
+                month_tick_positions.append((month_start + cursor) / 2.0)
+                month_count_annotations.append(
+                    ((month_start + cursor) / 2.0, vs_month_assignee_counts[month_idx], vs_month_ticket_totals[month_idx])
+                )
+            else:
+                month_tick_positions.append(month_start)
+                month_count_annotations.append((month_start, vs_month_assignee_counts[month_idx], vs_month_ticket_totals[month_idx]))
+
+            month_boundaries.append(cursor)
+            if month_idx < len(vs_individual_by_month) - 1:
+                cursor += month_gap
+
+        bar_widths: List[float] = []
+        for month_data in vs_individual_by_month:
+            for size in _PR_SIZE_ORDER:
+                points = month_data.get(size, [])
+                if not points:
+                    continue
+                w = float(size_bar_widths.get(size, 0.88))
+                bar_widths.extend([w] * len(points))
+
+        ax_vs_individual.bar(xpos, yvals, width=bar_widths, color=colors, alpha=0.88)
+
+        if len(xpos) >= 2:
+            x_mean = sum(xpos) / float(len(xpos))
+            y_mean = sum(yvals) / float(len(yvals))
+            num = sum((xv - x_mean) * (yv - y_mean) for xv, yv in zip(xpos, yvals))
+            den = sum((xv - x_mean) * (xv - x_mean) for xv in xpos)
+            if den > 0:
+                slope = num / den
+                intercept = y_mean - (slope * x_mean)
+                trend_x_start = min(xpos)
+                trend_x_end = max(xpos)
+                trend_y_start = (slope * trend_x_start) + intercept
+                trend_y_end = (slope * trend_x_end) + intercept
+                ax_vs_individual.plot(
+                    [trend_x_start, trend_x_end],
+                    [trend_y_start, trend_y_end],
+                    color="#9a9a9a",
+                    linewidth=1.2,
+                    linestyle=":",
+                    alpha=0.7,
+                    zorder=3,
+                )
+
+        for center_x, size in group_annotations:
+            ax_vs_individual.annotate(
+                size,
+                xy=(center_x, 0),
+                xytext=(0, 2),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=6,
+                color="#333333",
+                clip_on=False,
+            )
+
+        for boundary in month_boundaries[:-1]:
+            ax_vs_individual.axvline(boundary + (month_gap / 2.0), color="#d8d8d8", linestyle=":", linewidth=0.8, zorder=0)
+
+        max_y = max(yvals) if yvals else 0.0
+        month_label_y = max(12.0, max_y * 1.12)
+
+        icon_cache_dir = os.path.join(CONSOLIDATED_DIR, "priority-icons")
+        os.makedirs(icon_cache_dir, exist_ok=True)
+        icon_image_cache: Dict[str, Optional[object]] = {}
+
+        def _load_priority_icon_image(icon_url: str):
+            url = str(icon_url or "").strip()
+            if not url:
+                return None
+            if url in icon_image_cache:
+                return icon_image_cache[url]
+
+            fetch_urls = [url]
+            if url.lower().endswith(".svg"):
+                fetch_urls = [url[:-4] + ".png", url]
+
+            image_data = None
+            for candidate_url in fetch_urls:
+                ext = os.path.splitext(urlparse(candidate_url).path)[1].lower()
+                if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                    ext = ".png"
+                cache_name = f"{hashlib.md5(candidate_url.encode('utf-8')).hexdigest()}{ext}"
+                cache_path = os.path.join(icon_cache_dir, cache_name)
+
+                raw_bytes: Optional[bytes] = None
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path, "rb") as f:
+                            raw_bytes = f.read()
+                    except OSError:
+                        raw_bytes = None
+                else:
+                    try:
+                        with urlopen(candidate_url, timeout=4) as resp:
+                            raw_bytes = resp.read()
+                        if raw_bytes:
+                            with open(cache_path, "wb") as f:
+                                f.write(raw_bytes)
+                    except Exception:
+                        raw_bytes = None
+
+                if not raw_bytes:
+                    continue
+
+                try:
+                    image_data = mpimg.imread(BytesIO(raw_bytes), format="png")
+                except Exception:
+                    try:
+                        image_data = mpimg.imread(cache_path)
+                    except Exception:
+                        image_data = None
+                if image_data is not None:
+                    break
+
+            icon_image_cache[url] = image_data
+            return image_data
+
+        priority_styles = {
+            "Critical": {"marker": "D", "color": "#b2182b"},
+            "High": {"marker": "^", "color": "#ef8a62"},
+            "Low": {"marker": "s", "color": "#2166ac"},
+        }
+        priority_icon_y = -0.88
+        for xv, yv, pv, icon_url in zip(xpos, yvals, priorities, priority_icon_urls):
+            if pv == "Medium":
+                continue
+
+            icon_y = priority_icon_y
+            image_data = _load_priority_icon_image(icon_url)
+            if image_data is not None:
+                icon = OffsetImage(image_data, zoom=0.26)
+                icon.set_alpha(0.72)
+                marker = AnnotationBbox(
+                    icon,
+                    (xv, icon_y),
+                    frameon=False,
+                    box_alignment=(0.5, 0.0),
+                    annotation_clip=False,
+                    pad=0,
+                    zorder=4,
+                )
+                ax_vs_individual.add_artist(marker)
+                continue
+
+            style = priority_styles.get(pv)
+            if style:
+                ax_vs_individual.scatter(
+                    [xv],
+                    [icon_y],
+                    marker=style["marker"],
+                    s=20,
+                    facecolors="white",
+                    edgecolors=style["color"],
+                    linewidths=0.8,
+                    alpha=0.65,
+                    zorder=4,
+                    clip_on=False,
+                )
+
+        for month_x, dev_count, total_count in month_count_annotations:
+            ax_vs_individual.annotate(
+                f"{total_count} tickets | {dev_count} devs",
+                xy=(month_x, month_label_y),
+                xytext=(0, 2),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#444444",
+            )
+        ax_vs_individual.set_ylim(bottom=0, top=max(12.0, month_label_y * 1.10))
+
+        ax_vs_individual.set_xlim(-0.8, (month_boundaries[-1] + 0.8) if month_boundaries else 0.8)
+        ax_vs_individual.set_xticks(month_tick_positions)
+        ax_vs_individual.set_xticklabels(labels, rotation=0, ha="center")
+        ax_vs_individual.tick_params(axis="x", pad=8)
+    else:
+        ax_vs_individual.text(0.5, 0.5, "No PR tickets in selected window", ha="center", va="center", transform=ax_vs_individual.transAxes)
+        ax_vs_individual.set_xticks([])
+
+    ax_vs_individual.text(
+        0.01,
+        0.98,
+        f"Outliers excluded: {vs_individual_outliers_excluded}",
+        transform=ax_vs_individual.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        color="#666666",
+    )
+    ax_vs_individual.text(
+        0.99,
+        0.98,
+        f"{total_pr_count} PRs",
+        transform=ax_vs_individual.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        color="#444444",
+    )
+    ax_vs_individual.set_ylabel("Days")
+    ax_vs_individual.grid(axis="y", alpha=0.25, linestyle=":")
+    ax_vs_individual.set_title("Lead Time - PR Reviews (Individual PRs)", fontsize=12, fontweight="bold")
+    fig_vs_individual.tight_layout()
+    fig_vs_individual.subplots_adjust(bottom=0.20)
+    fig_vs_individual.savefig(out_vs_individual, dpi=200, bbox_inches="tight")
+    plt.close(fig_vs_individual)
+
+    # --- KTLO chart: lead time by ticket type ---
+    fig_ktlo, ax_ktlo = plt.subplots(figsize=(13, 5))
+    types_by_volume = sorted(sorted_ktlo_types, key=lambda t: (-ktlo_type_totals.get(t, 0), t.lower()))
+    types_by_volume = [t for t in types_by_volume if ktlo_type_totals.get(t, 0) > 0]
+
+    for idx, issue_type in enumerate(types_by_volume):
+        color = _issue_type_color(issue_type)
+        ax_ktlo.plot(x, ktlo_series_all[issue_type], color=color, linewidth=2.4,
+                     marker="o", markersize=6, linestyle="-", label=f"{issue_type} (all)")
+        ax_ktlo.plot(x, ktlo_series_filtered[issue_type], color=color, linewidth=1.9,
+                     marker="o", markersize=6, linestyle="--", dashes=(6, 3), alpha=0.5,
+                     label=f"{issue_type} (excl outliers)")
+
+    ax_ktlo.set_ylabel("Days")
+    _, ktlo_top = ax_ktlo.get_ylim()
+    ax_ktlo.set_ylim(bottom=0, top=max(12, ktlo_top * 1.15))
+    ax_ktlo.set_xticks(x)
+    ktlo_labels = [
+        f"{label}\nn={count} | devs={devs}"
+        for label, count, devs in zip(labels, ktlo_month_ticket_counts, ktlo_month_assignee_counts)
+    ]
+    ax_ktlo.set_xticklabels(ktlo_labels, rotation=20, ha="right")
+    ax_ktlo.grid(alpha=0.25, linestyle=":")
+    ax_ktlo.legend(loc="upper left", ncol=2, fontsize=8)
+    ax_ktlo.set_title("KTLO – Lead Time by Ticket Type (excl. outliers, Won't Do, Duplicate, Feature, Willem/EM)", fontsize=11, fontweight="bold")
+    fig_ktlo.tight_layout()
+    fig_ktlo.savefig(out_ktlo, dpi=200, bbox_inches="tight")
+    plt.close(fig_ktlo)
+
+    return f"{out_vs},{out_vs_individual},{out_ktlo}"
 
 
 def _has_visible_cells(mask) -> bool:
@@ -1063,6 +2188,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         out = generate_team_heatmap(derived_payload, year, month)
         if out:
             print(f"  Saved: {out}")
+
+    if not args.service_only and not args.team_only:
+        print("\nFlow trend charts:")
+        out = generate_flow_trend_chart(year, month, lookback_months=6)
+        for path in (out or "").split(","):
+            path = path.strip()
+            if path:
+                print(f"  Saved: {path}")
 
     print("\nDone.")
 
