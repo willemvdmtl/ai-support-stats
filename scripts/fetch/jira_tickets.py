@@ -135,6 +135,7 @@ def jira_search(site: str, email: str, api_token: str, jql: str, max_results: in
         "jql": jql,
         "maxResults": max_results,
         "fields": ["*all"],
+        "expand": "changelog",
     }
     if next_page_token:
         payload["nextPageToken"] = next_page_token

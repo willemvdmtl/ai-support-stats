@@ -1,5 +1,6 @@
 keyring
 matplotlib
 numpy
+openpyxl
 pandas
 seaborn

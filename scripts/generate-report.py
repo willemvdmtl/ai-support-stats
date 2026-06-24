@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate a monthly markdown report with configurable cycle-time groups."""
+"""Generate a monthly markdown report with configurable Jira flow metrics."""
 
 import argparse
 import datetime as dt
+import math
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -17,6 +18,7 @@ JIRA_CONFIG_FILE = "config/jira-minimal.json"
 GITHUB_CONFIG_FILE = "config/github-minimal.json"
 METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
 INTERNAL_TEAM_FILE = "config/github-internal-team.json"
+OUTLIER_IQR_MULTIPLIER = 3.0
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -212,6 +214,17 @@ def ticket_labels(ticket: Dict) -> set:
     return {str(label).strip().lower() for label in labels if str(label).strip()}
 
 
+def ticket_resolution_name(ticket: Dict) -> str:
+    fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+    resolution = fields.get("resolution") if isinstance(fields.get("resolution"), dict) else {}
+    return str(resolution.get("name") or "").strip()
+
+
+def normalized_resolution_name(ticket: Dict) -> str:
+    normalized = ticket_resolution_name(ticket).strip().lower().replace("'", "")
+    return " ".join(normalized.split())
+
+
 def ticket_matches_filter(ticket: Dict, filter_spec: Dict[str, set]) -> bool:
     issue_types = filter_spec.get("issue_types") or set()
     labels = filter_spec.get("labels") or set()
@@ -230,6 +243,9 @@ def chart_files(year: int, month: int) -> Dict[str, str]:
         "github_split": os.path.join(REPORTS_DIR, f"github_pr_internal_external_{year}_{month:02d}.png"),
         "jira_service": os.path.join(REPORTS_DIR, f"jira_service_heatmap_{year}_{month:02d}.png"),
         "jira_team": os.path.join(REPORTS_DIR, f"jira_requesting_team_heatmap_{year}_{month:02d}.png"),
+        "jira_flow_trend_vs": os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_{year}_{month:02d}.png"),
+        "jira_flow_trend_vs_individual": os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_individual_{year}_{month:02d}.png"),
+        "jira_flow_trend_ktlo": os.path.join(REPORTS_DIR, f"jira_flow_trend_ktlo_{year}_{month:02d}.png"),
     }
 
 
@@ -497,7 +513,7 @@ def select_group_tickets(all_tickets: List[Dict], group: Dict[str, object]) -> L
     return list(selected.values())
 
 
-def jira_cycle_stats_in_window(
+def jira_lead_stats_in_window(
     tickets: List[Dict],
     window_start: dt.datetime,
     window_end: dt.datetime,
@@ -541,11 +557,213 @@ def jira_cycle_stats_in_window(
     return durations_days, longest_wait
 
 
+def is_cycle_start_status(status_name: str) -> bool:
+    name = status_name.strip().lower()
+    if not name:
+        return False
+    if name in {"in progress", "in development", "development in progress", "doing"}:
+        return True
+    return "in progress" in name
+
+
+def is_cycle_fallback_review_status(status_name: str) -> bool:
+    return status_name.strip().lower() == "in review"
+
+
+def first_in_progress_transition_at(ticket: Dict) -> Optional[dt.datetime]:
+    changelog = ticket.get("changelog") if isinstance(ticket.get("changelog"), dict) else {}
+    histories = changelog.get("histories") if isinstance(changelog.get("histories"), list) else []
+
+    transition_times: List[dt.datetime] = []
+    fallback_review_times: List[dt.datetime] = []
+    for history in histories:
+        if not isinstance(history, dict):
+            continue
+
+        changed_at = parse_jira_datetime(str(history.get("created") or ""))
+        if changed_at is None:
+            continue
+
+        items = history.get("items") if isinstance(history.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("field") or "").strip().lower() != "status":
+                continue
+
+            to_status = str(item.get("toString") or "")
+            if is_cycle_start_status(to_status):
+                transition_times.append(changed_at)
+                break
+            if is_cycle_fallback_review_status(to_status):
+                fallback_review_times.append(changed_at)
+                break
+
+    if transition_times:
+        return min(transition_times)
+
+    if fallback_review_times:
+        return min(fallback_review_times)
+
+    return None
+
+
+def jira_cycle_stats_in_window(
+    tickets: List[Dict],
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    validity: Dict[str, bool],
+) -> Tuple[List[float], Optional[Dict[str, object]]]:
+    durations_days: List[float] = []
+    longest_wait: Optional[Dict[str, object]] = None
+
+    for ticket in tickets:
+        fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if resolution is None and validity.get("require_resolved", True):
+            continue
+        if resolution is None:
+            continue
+
+        resolution_utc = resolution.astimezone(dt.timezone.utc)
+        if not (window_start <= resolution_utc < window_end):
+            continue
+
+        cycle_start = first_in_progress_transition_at(ticket)
+        if cycle_start is None:
+            continue
+
+        delta = (resolution - cycle_start).total_seconds()
+        if delta < 0 and validity.get("exclude_negative_durations", True):
+            continue
+
+        cycle_days = delta / 86400.0
+        durations_days.append(cycle_days)
+
+        if longest_wait is None or cycle_days > float(longest_wait["days"]):
+            longest_wait = {
+                "key": ticket.get("key", ""),
+                "days": cycle_days,
+                "status": "resolved",
+            }
+
+    return durations_days, longest_wait
+
+
+def is_pr_like_ticket(ticket: Dict) -> bool:
+    issue_type = ticket_issue_type(ticket).strip().lower()
+    if issue_type in {"pr request", "pull request", "pr"}:
+        return True
+    return issue_type.startswith("pr ") or issue_type.endswith(" pr")
+
+
+def resolved_tickets_in_window(tickets: List[Dict], window_start: dt.datetime, window_end: dt.datetime) -> List[Dict]:
+    selected: List[Dict] = []
+    for ticket in tickets:
+        fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+        resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if resolution is None:
+            continue
+        resolution_utc = resolution.astimezone(dt.timezone.utc)
+        if window_start <= resolution_utc < window_end:
+            selected.append(ticket)
+    return selected
+
+
 def image_block(path: str, alt_text: str, report_dir: str) -> str:
     if os.path.exists(path):
         rel_path = os.path.relpath(path, start=report_dir or ".").replace(os.sep, "/")
         return f"![{alt_text}]({rel_path})"
     return f"_Not available: {path}_"
+
+
+def markdown_table_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").rstrip()
+
+
+def format_metric_value(durations: List[float], suffix: str) -> str:
+    if not durations:
+        return "unavailable"
+    avg_days = sum(durations) / len(durations)
+    unit = "ticket" if len(durations) == 1 else "tickets"
+    return f"{avg_days:.2f} days{suffix} ({len(durations)} {unit})"
+
+
+def format_metric_value_plain(durations: List[float], suffix: str) -> str:
+    if not durations:
+        return "unavailable"
+    avg_days = sum(durations) / len(durations)
+    return f"{avg_days:.2f} days{suffix}"
+
+
+def percentile(sorted_values: List[float], percent: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+
+    rank = (len(sorted_values) - 1) * (percent / 100.0)
+    lower_idx = int(math.floor(rank))
+    upper_idx = int(math.ceil(rank))
+
+    if lower_idx == upper_idx:
+        return float(sorted_values[lower_idx])
+
+    weight = rank - lower_idx
+    lower_val = float(sorted_values[lower_idx])
+    upper_val = float(sorted_values[upper_idx])
+    return lower_val + (upper_val - lower_val) * weight
+
+
+def filter_iqr_outliers(values: List[float]) -> Tuple[List[float], int]:
+    if len(values) < 4:
+        return list(values), 0
+
+    ordered = sorted(float(v) for v in values)
+    q1 = percentile(ordered, 25)
+    q3 = percentile(ordered, 75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return list(values), 0
+
+    upper = q3 + OUTLIER_IQR_MULTIPLIER * iqr
+    filtered = [float(v) for v in values if float(v) <= upper]
+    outlier_count = len(values) - len(filtered)
+    if outlier_count <= 0:
+        return list(values), 0
+    if not filtered:
+        return list(values), 0
+
+    return filtered, outlier_count
+
+
+def append_metric_rows(
+    rows: List[Dict[str, str]],
+    type_label: str,
+    lead_durations: List[float],
+    cycle_durations: List[float],
+    suffix: str,
+    level: int,
+    emphasize: bool = False,
+) -> None:
+    if level <= 0:
+        type_cell = f"**{type_label}**" if emphasize else type_label
+    elif level == 1:
+        type_cell = f"• {type_label}"
+    else:
+        type_cell = f"• {type_label}"
+
+    lead_display = format_metric_value(lead_durations, suffix)
+    cycle_display = format_metric_value(cycle_durations, suffix)
+    if emphasize:
+        lead_display = f"**{lead_display}**"
+        cycle_display = f"**{cycle_display}**"
+
+    rows.append({
+        "type": type_cell,
+        "lead": lead_display,
+        "cycle": cycle_display,
+    })
 
 
 def build_report(year: int, month: int, report_dir: str) -> str:
@@ -556,42 +774,125 @@ def build_report(year: int, month: int, report_dir: str) -> str:
     all_tickets = all_jira_tickets()
     policy = load_metric_groups_policy()
     validity = policy.get("validity") if isinstance(policy.get("validity"), dict) else {}
+    jira_flow_trend_vs_individual_chart = charts["jira_flow_trend_vs_individual"]
 
-    group_lines: List[str] = []
-    longest_wait: Optional[Dict[str, object]] = None
+    metric_sections: List[Dict[str, object]] = []
+    longest_lead: Optional[Dict[str, object]] = None
+    longest_cycle: Optional[Dict[str, object]] = None
 
     groups = policy.get("groups") if isinstance(policy.get("groups"), list) else []
     for idx, group in enumerate(groups):
         if not isinstance(group, dict):
             continue
+        group_id = str(group.get("id") or "").strip().lower()
         label = str(group.get("label") or "Group")
         group_tickets = select_group_tickets(all_tickets, group)
+
+        if group_id == "ktlo" or label.strip().lower() == "ktlo":
+            excluded_resolutions = {"wont do", "duplicate"}
+            group_tickets = [
+                ticket for ticket in group_tickets
+                if normalized_resolution_name(ticket) not in excluded_resolutions
+                and ticket_issue_type(ticket).strip().lower() != "epic"
+            ]
+
         window_policy = group.get("window_policy") if isinstance(group.get("window_policy"), dict) else {}
         (window_start, window_end), suffix = resolve_window(year, month, window_policy)
-        durations, longest = jira_cycle_stats_in_window(group_tickets, window_start, window_end, validity)
+        lead_durations, longest_group_lead = jira_lead_stats_in_window(group_tickets, window_start, window_end, validity)
+        cycle_durations, longest_group_cycle = jira_cycle_stats_in_window(group_tickets, window_start, window_end, validity)
 
-        if durations:
-            avg_days = sum(durations) / len(durations)
-            group_lines.append(
-                f"**Cycle Time - {label}:** {avg_days:.2f} days"
-                f"{suffix} (average from {len(durations)} tickets)"
-            )
-        else:
-            group_lines.append(f"**Cycle Time - {label}:** unavailable")
+        section_rows: List[Dict[str, str]] = []
+        filtered_section_rows: List[Dict[str, str]] = []
+        append_metric_rows(section_rows, label, lead_durations, cycle_durations, suffix, level=0, emphasize=True)
+        filtered_lead_durations, _ = filter_iqr_outliers(lead_durations)
+        filtered_cycle_durations, _ = filter_iqr_outliers(cycle_durations)
+        append_metric_rows(filtered_section_rows, label, filtered_lead_durations, filtered_cycle_durations, suffix, level=0, emphasize=True)
 
         if idx == 0:
-            longest_wait = longest
+            longest_lead = longest_group_lead
+            longest_cycle = longest_group_cycle
 
-    if not group_lines:
-        group_lines.append("**Cycle Time:** unavailable (no metric groups configured)")
+        if group_id == "vertical_support" or label.strip().lower() == "vertical support":
+            pr_tickets = [ticket for ticket in group_tickets if is_pr_like_ticket(ticket)]
+            other_tickets = [ticket for ticket in group_tickets if not is_pr_like_ticket(ticket)]
 
-    if longest_wait is None:
-        longest_wait_line = "**Longest Wait:** unavailable"
+            pr_lead_durations, _ = jira_lead_stats_in_window(pr_tickets, window_start, window_end, validity)
+            pr_cycle_durations, _ = jira_cycle_stats_in_window(pr_tickets, window_start, window_end, validity)
+            other_lead_durations, _ = jira_lead_stats_in_window(other_tickets, window_start, window_end, validity)
+            other_cycle_durations, _ = jira_cycle_stats_in_window(other_tickets, window_start, window_end, validity)
+
+            append_metric_rows(section_rows, "PR Tickets", pr_lead_durations, pr_cycle_durations, suffix, level=1)
+            append_metric_rows(section_rows, "Other Tickets", other_lead_durations, other_cycle_durations, suffix, level=1)
+
+            filtered_pr_lead_durations, _ = filter_iqr_outliers(pr_lead_durations)
+            filtered_pr_cycle_durations, _ = filter_iqr_outliers(pr_cycle_durations)
+            filtered_other_lead_durations, _ = filter_iqr_outliers(other_lead_durations)
+            filtered_other_cycle_durations, _ = filter_iqr_outliers(other_cycle_durations)
+
+            append_metric_rows(filtered_section_rows, "PR Tickets", filtered_pr_lead_durations, filtered_pr_cycle_durations, suffix, level=1)
+            append_metric_rows(filtered_section_rows, "Other Tickets", filtered_other_lead_durations, filtered_other_cycle_durations, suffix, level=1)
+
+        if group_id == "ktlo" or label.strip().lower() == "ktlo":
+            issue_type_buckets: Dict[str, List[Dict]] = {}
+            for ticket in group_tickets:
+                issue_type = ticket_issue_type(ticket) or "Unspecified"
+                issue_type_buckets.setdefault(issue_type, []).append(ticket)
+
+            ranked_issue_types = sorted(
+                issue_type_buckets.items(),
+                key=lambda item: (-len(jira_lead_stats_in_window(item[1], window_start, window_end, validity)[0]), item[0].lower()),
+            )
+
+            for issue_type, issue_type_tickets in ranked_issue_types:
+                type_lead_durations, _ = jira_lead_stats_in_window(issue_type_tickets, window_start, window_end, validity)
+                type_cycle_durations, _ = jira_cycle_stats_in_window(issue_type_tickets, window_start, window_end, validity)
+                if not type_lead_durations and not type_cycle_durations:
+                    continue
+                append_metric_rows(section_rows, issue_type, type_lead_durations, type_cycle_durations, suffix, level=1)
+
+                filtered_type_lead_durations, _ = filter_iqr_outliers(type_lead_durations)
+                filtered_type_cycle_durations, _ = filter_iqr_outliers(type_cycle_durations)
+                append_metric_rows(filtered_section_rows, issue_type, filtered_type_lead_durations, filtered_type_cycle_durations, suffix, level=1)
+
+        metric_sections.append({
+            "id": group_id,
+            "label": label,
+            "rows": section_rows,
+            "filtered_rows": filtered_section_rows,
+        })
+
+    if not metric_sections:
+        metric_sections.append({
+            "id": "",
+            "label": "No metric groups configured",
+            "rows": [{
+                "type": "**No metric groups configured**",
+                "lead": "**unavailable**",
+                "cycle": "**unavailable**",
+            }],
+            "filtered_rows": [{
+                "type": "**No metric groups configured**",
+                "lead": "**unavailable**",
+                "cycle": "**unavailable**",
+            }],
+        })
+
+    if longest_lead is None:
+        longest_lead_line = "**Longest Lead Time:** unavailable"
     else:
-        longest_wait_line = (
-            "**Longest Wait:** "
-            f"{float(longest_wait['days']):.2f} days "
-            f"({longest_wait['key']}, {longest_wait['status']})"
+        longest_lead_line = (
+            "**Longest Lead Time:** "
+            f"{float(longest_lead['days']):.2f} days "
+            f"({longest_lead['key']}, {longest_lead['status']})"
+        )
+
+    if longest_cycle is None:
+        longest_cycle_line = "**Longest Cycle Time:** unavailable"
+    else:
+        longest_cycle_line = (
+            "**Longest Cycle Time:** "
+            f"{float(longest_cycle['days']):.2f} days "
+            f"({longest_cycle['key']}, {longest_cycle['status']})"
         )
 
     lines = [
@@ -599,8 +900,56 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         "",
     ]
 
-    for line in group_lines:
-        lines.extend([line, ""])
+    lines.extend([
+        "## Jira Flow Metrics",
+        "",
+        "### Flow Trend (Individual PR Lead Time)",
+        image_block(jira_flow_trend_vs_individual_chart, f"Vertical Support Individual PR Lead Time {month_label}", report_dir),
+        "",
+        "| Type | Lead Time (avg.) | Cycle Time (avg.) |",
+        "| --- | --- | --- |",
+    ])
+
+    for section in metric_sections:
+        rows = section.get("rows") if isinstance(section.get("rows"), list) else []
+        for row in rows:
+            type_value = row.get("type", "") if isinstance(row, dict) else ""
+            lead_value = row.get("lead", "unavailable") if isinstance(row, dict) else "unavailable"
+            cycle_value = row.get("cycle", "unavailable") if isinstance(row, dict) else "unavailable"
+            lines.append(
+                "| "
+                f"{markdown_table_cell(type_value)} | "
+                f"{markdown_table_cell(lead_value)} | "
+                f"{markdown_table_cell(cycle_value)} |"
+            )
+
+        lines.append("|  |  |  |")
+
+    lines.append("")
+
+    lines.extend([
+        "### Jira Flow Metrics (Excluding Outliers)",
+        "",
+        "| Type | Lead Time (avg.) | Cycle Time (avg.) |",
+        "| --- | --- | --- |",
+    ])
+
+    for section in metric_sections:
+        rows = section.get("filtered_rows") if isinstance(section.get("filtered_rows"), list) else []
+        for row in rows:
+            type_value = row.get("type", "") if isinstance(row, dict) else ""
+            lead_value = row.get("lead", "unavailable") if isinstance(row, dict) else "unavailable"
+            cycle_value = row.get("cycle", "unavailable") if isinstance(row, dict) else "unavailable"
+            lines.append(
+                "| "
+                f"{markdown_table_cell(type_value)} | "
+                f"{markdown_table_cell(lead_value)} | "
+                f"{markdown_table_cell(cycle_value)} |"
+            )
+
+        lines.append("|  |  |  |")
+
+    lines.append("")
 
     if pr_split is None:
         lines.extend(["**Internal vs External PRs:** unavailable", ""])
@@ -615,7 +964,9 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         lines.extend([stat_line, ""])
 
     lines.extend([
-        longest_wait_line,
+        longest_lead_line,
+        "",
+        longest_cycle_line,
         "",
         "## GitHub Charts",
         "",
@@ -625,7 +976,7 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         "### Internal vs External PRs",
         image_block(charts["github_split"], f"GitHub Internal vs External {month_label}", report_dir),
         "",
-        "## Jira Charts",
+        "## Jira Charts - Vertical Support",
         "",
         "### Service Heatmap",
         image_block(charts["jira_service"], f"Jira Service Heatmap {month_label}", report_dir),
@@ -639,7 +990,7 @@ def build_report(year: int, month: int, report_dir: str) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Generate a markdown report with charts and cycle time stat.")
+    parser = argparse.ArgumentParser(description="Generate a markdown report with charts and Jira lead/cycle time stats.")
     parser.add_argument("--month", default="", help="Target month (YYYY-MM). Defaults to current month.")
     parser.add_argument("--output", default="", help="Optional output markdown file path.")
     args = parser.parse_args(argv)
