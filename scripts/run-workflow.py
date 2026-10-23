@@ -193,6 +193,11 @@ def main() -> None:
             fetch_cmd.append("--force")
         run_step("Fetch Jira data", fetch_cmd)
 
+        fetch_cmd = [py, os.path.join(scripts_dir, "fetch-data.py"), "jira-backlog"]
+        if args.force_fetch:
+            fetch_cmd.append("--force")
+        run_step("Fetch Jira backlog snapshot", fetch_cmd)
+
     if not args.skip_generate:
         generate_cmd = [py, os.path.join(scripts_dir, "generate-charts.py")]
         generate_cmd.extend(["--month", month_key])

@@ -321,6 +321,236 @@ def build_assignment_timeline(
     return _apply_assignment_timeline_corrections(months, timeline, corrections)
 
 
+def compute_threshold_active_months(
+    entry: dict,
+    all_months: List[str],
+    per_month_threshold: int = 3,
+    departure_window: int = 2,
+    join_window: int = 1,
+    preview_overrides: Optional[Dict[str, dict]] = None,
+) -> set:
+    """
+    Determine active months for a person using per-month threshold + leniency rules.
+
+    Rules:
+      1. Directly active:   month event count >= per_month_threshold
+
+      For months BELOW threshold, leniency is applied based on whether the month
+      has any events:
+
+      2. Non-zero low months (1 ≤ events < threshold):
+         - Departure leniency: within `departure_window` months after a directly-active month
+         - Join leniency:      within `join_window` months before a directly-active month
+
+      3. Zero-event months:
+         - Departure leniency: within 1 month after a directly-active month (N=1, unchanged)
+         - Join leniency:      within 1 month before a directly-active month (N=1, unchanged)
+
+    The narrower window for zero-event months avoids incorrectly retaining people who
+    left mid-tenure (e.g. Thomas Wilks with 0-event months well after last active month),
+    while the wider window for non-zero months avoids penalising established members
+    who had legitimately quiet periods (e.g. Ellie Rahimi with 2 events in 2025-03).
+    """
+    month_event_counts = entry.get("month_event_counts") or {}
+
+    directly_active = {
+        month for month in all_months
+        if month_event_counts.get(month, 0) >= per_month_threshold
+    }
+
+    active = set(directly_active)
+
+    for i, month in enumerate(all_months):
+        if month in directly_active:
+            continue
+
+        has_events = month_event_counts.get(month, 0) >= 1
+        dep_w = departure_window if has_events else 1
+        jn_w = join_window if has_events else 1
+
+        # Departure leniency: last directly-active month within dep_w steps
+        for step in range(1, dep_w + 1):
+            prev_idx = i - step
+            if prev_idx >= 0 and all_months[prev_idx] in directly_active:
+                active.add(month)
+                break
+
+        if month in active:
+            continue
+
+        # Join leniency: next directly-active month within jn_w steps
+        for step in range(1, jn_w + 1):
+            next_idx = i + step
+            if next_idx < len(all_months) and all_months[next_idx] in directly_active:
+                active.add(month)
+                break
+
+    person_name = entry.get("displayName", "")
+    person_override = (preview_overrides or {}).get(person_name) or {}
+    force_active = {
+        str(month)
+        for month in (person_override.get("force_active_months") or [])
+        if str(month) in set(all_months)
+    }
+    force_inactive = {
+        str(month)
+        for month in (person_override.get("force_inactive_months") or [])
+        if str(month) in set(all_months)
+    }
+
+    active.update(force_active)
+    active.difference_update(force_inactive)
+
+    return active
+
+
+def write_threshold_preview_svg(
+    months: List[str],
+    timeline: List[dict],
+    current_roster_by_month: Dict[str, set],
+    per_month_threshold: int = 3,
+    departure_window: int = 2,
+    join_window: int = 1,
+    preview_overrides: Optional[Dict[str, dict]] = None,
+    title: str = "Team Composition — Threshold Preview",
+    subtitle: Optional[str] = None,
+    monthly_rows: Optional[List[dict]] = None,
+) -> str:
+    """
+    Write a diagnostic SVG identical in layout to the timeline SVG, but with
+    coloured highlights showing the effect of applying a per-month event threshold:
+
+      - Teal:  currently active, remains active under new rules  (unchanged)
+      - Grey:  currently inactive, remains inactive              (unchanged)
+      - Red:   currently active, would be EXCLUDED by new rules
+      - Green: currently inactive, would be INCLUDED by new rules
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, "timeline-threshold-preview.svg")
+
+    subtitle_y = 62
+    legend_y = 84
+    month_label_y = 116
+    month_headcount_y = 132
+    left_margin = 280
+    top_margin = 138
+    right_margin = 40
+    bottom_margin = 50
+    cell_width = 28
+    cell_height = 22
+    row_gap = 6
+    name_x = 18
+
+    width = left_margin + (len(months) * cell_width) + right_margin
+    height = top_margin + (len(timeline) * (cell_height + row_gap)) + bottom_margin
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}">'
+        ),
+        "<style>",
+        ".bg { fill: #f6f7f4; }",
+        ".title { fill: #162521; font: 700 24px Helvetica, Arial, sans-serif; }",
+        ".subtitle { fill: #51605a; font: 12px Helvetica, Arial, sans-serif; }",
+        ".name { fill: #1f312c; font: 12px Helvetica, Arial, sans-serif; }",
+        ".month { fill: #48615a; font: 11px Helvetica, Arial, sans-serif; }",
+        ".grid { fill: #edf1ee; stroke: #d6ddd8; stroke-width: 1; }",
+        ".active { fill: #0f766e; stroke: #0b5b54; stroke-width: 1; }",
+        ".excluded { fill: #dc2626; stroke: #b91c1c; stroke-width: 1; }",
+        ".included { fill: #16a34a; stroke: #15803d; stroke-width: 1; }",
+        ".rowline { stroke: #e1e7e3; stroke-width: 1; }",
+        ".legend { fill: #33443e; font: 11px Helvetica, Arial, sans-serif; }",
+        ".legend-box { stroke-width: 1; }",
+        "</style>",
+        f'<rect class="bg" x="0" y="0" width="{width}" height="{height}" />',
+        f'<text class="title" x="18" y="34">{html.escape(title)}</text>',
+        (
+            f'<text class="subtitle" x="18" y="{subtitle_y}">'
+            f'{html.escape(subtitle or f"Per-month threshold: {per_month_threshold} events  |  {months[0]} → {months[-1]}")}'
+            "</text>"
+        ),
+        # Legend
+        f'<rect class="active legend-box" x="18" y="{legend_y}" width="14" height="14" rx="2" />',
+        f'<text class="legend" x="36" y="{legend_y + 11}">Active (unchanged)</text>',
+        f'<rect class="excluded legend-box" x="160" y="{legend_y}" width="14" height="14" rx="2" />',
+        f'<text class="legend" x="178" y="{legend_y + 11}">Would be excluded</text>',
+        f'<rect class="included legend-box" x="310" y="{legend_y}" width="14" height="14" rx="2" />',
+        f'<text class="legend" x="328" y="{legend_y + 11}">Would be included</text>',
+    ]
+
+    # Build headcount lookup
+    headcount_by_month = {}
+    if monthly_rows:
+        for row in monthly_rows:
+            headcount_by_month[row["month"]] = row["headcount"]
+
+    for index, month in enumerate(months):
+        x = left_margin + (index * cell_width) + (cell_width / 2)
+        label = html.escape(month)
+        lines.append(
+            (
+                f'<text class="month" x="{x:.1f}" y="{month_label_y}" '
+                f'text-anchor="start" transform="rotate(-45 {x:.1f} {month_label_y})">{label}</text>'
+            )
+        )
+        if month in headcount_by_month:
+            headcount = headcount_by_month[month]
+            lines.append(
+                (
+                    f'<text class="month" x="{x:.1f}" y="{month_headcount_y}" '
+                    f'text-anchor="middle" font-size="10">{headcount}</text>'
+                )
+            )
+
+    for row_index, member in enumerate(timeline):
+        y = top_margin + (row_index * (cell_height + row_gap))
+        name = html.escape(member["displayName"])
+
+        current_active = current_roster_by_month  # dict of month -> set of names
+        new_active = compute_threshold_active_months(
+            member,
+            months,
+            per_month_threshold,
+            departure_window,
+            join_window,
+            preview_overrides,
+        )
+
+        lines.append(
+            f'<line class="rowline" x1="18" y1="{y - 4}" x2="{width - 20}" y2="{y - 4}" />'
+        )
+        lines.append(
+            f'<text class="name" x="{name_x}" y="{y + 15}">{name}</text>'
+        )
+
+        for col_index, month in enumerate(months):
+            x = left_margin + (col_index * cell_width)
+            is_currently_active = member["displayName"] in current_active.get(month, set())
+            is_new_active = month in new_active
+
+            if is_currently_active and is_new_active:
+                klass = "active"
+            elif is_currently_active and not is_new_active:
+                klass = "excluded"
+            elif not is_currently_active and is_new_active:
+                klass = "included"
+            else:
+                klass = "grid"
+
+            lines.append(
+                f'<rect class="{klass}" x="{x}" y="{y}" width="20" height="20" rx="3" />'
+            )
+
+    lines.append("</svg>")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return path
+
+
 def write_timeline_svg(
     months: List[str],
     timeline: List[dict],

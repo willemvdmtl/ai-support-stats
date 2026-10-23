@@ -5,17 +5,18 @@ import argparse
 import sys
 
 from fetch.github_prs import main as github_main
+from fetch.jira_backlog import main as jira_backlog_main
 from fetch.jira_tickets import main as jira_main
 
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description="Fetch data from supported sources.",
-        usage="python3 scripts/fetch-data.py {github|jira} [source options]",
+        usage="python3 scripts/fetch-data.py {github|jira|jira-backlog} [source options]",
     )
     parser.add_argument(
         "source",
-        choices=["github", "jira"],
+        choices=["github", "jira", "jira-backlog"],
         help="Which data source to fetch",
     )
     parser.add_argument(
@@ -35,6 +36,10 @@ def main(argv=None) -> None:
 
     if args.source == "jira":
         jira_main(forwarded)
+        return
+
+    if args.source == "jira-backlog":
+        jira_backlog_main(forwarded)
         return
 
     parser.error(f"Unsupported source: {args.source}")

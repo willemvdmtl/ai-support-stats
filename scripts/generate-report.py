@@ -3,12 +3,23 @@
 
 import argparse
 import datetime as dt
+import json
 import math
 import os
+import re
 import sys
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 from common.setup_utils import read_json
+from generate.jira_charts import (
+    DEFAULT_BASIC_GROUP_FIELDS,
+    _load_service_overrides,
+    _service_alias_map,
+    derive_normalized_tickets,
+    normalize_service_name,
+    ticket_basic_groups,
+)
 
 REPORTS_DIR = "reports"
 GITHUB_CACHE_DIR = "cache/github"
@@ -19,6 +30,15 @@ GITHUB_CONFIG_FILE = "config/github-minimal.json"
 METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
 INTERNAL_TEAM_FILE = "config/github-internal-team.json"
 OUTLIER_IQR_MULTIPLIER = 3.0
+DR_ENGINEER_ASSIGNMENTS = {
+    "ayman rezzou": {"weight": 1.0},
+    "evangelos aktoudianakis": {"weight": 1.0},
+    "marta ludovico": {"weight": 0.5},
+    "marcal montserrat cantos": {"weight": 0.5},
+    "john papin": {"weight": 1.0, "from": "2026-10-09"},
+    "john pappin": {"weight": 1.0, "from": "2026-10-09"},
+}
+DR_STRONG_ASSIGNEE_WEIGHT = 1.0
 
 
 def parse_month(raw: str) -> Tuple[int, int]:
@@ -195,6 +215,16 @@ def load_metric_groups_policy() -> Dict[str, object]:
                 }
             )
 
+    if not any(str(group.get("id") or "").strip().lower() == "disaster_recovery" for group in groups):
+        groups.append({
+            "id": "disaster_recovery",
+            "label": "Disaster Recovery",
+            "include_any": _normalize_filter({"labels": ["disaster-recovery"]}),
+            "exclude_any": _normalize_filter({}),
+            "force_include_any": _normalize_filter({}),
+            "window_policy": dict(default_window),
+        })
+
     return {
         "event_anchor": event_anchor,
         "validity": validity,
@@ -212,6 +242,352 @@ def ticket_labels(ticket: Dict) -> set:
     fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
     labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
     return {str(label).strip().lower() for label in labels if str(label).strip()}
+
+
+def normalized_match_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_value.lower()).strip()
+
+
+def ticket_assignee_name(ticket: Dict) -> str:
+    fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+    assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+    return str(assignee.get("displayName") or assignee.get("name") or "").strip()
+
+
+def ticket_activity_date(ticket: Dict) -> Optional[dt.date]:
+    fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+    for field_name in ("resolutiondate", "updated", "created"):
+        parsed = parse_jira_datetime(str(fields.get(field_name) or ""))
+        if parsed is not None:
+            return parsed.date()
+    return None
+
+
+def dr_engineer_weight(ticket: Dict) -> float:
+    assignment = DR_ENGINEER_ASSIGNMENTS.get(normalized_match_text(ticket_assignee_name(ticket)))
+    if not assignment:
+        return 0.0
+
+    effective_from = str(assignment.get("from") or "").strip()
+    if effective_from:
+        activity_date = ticket_activity_date(ticket)
+        try:
+            starts = dt.datetime.strptime(effective_from, "%Y-%m-%d").date()
+        except ValueError:
+            starts = None
+        if starts is not None and activity_date is not None and activity_date < starts:
+            return 0.0
+
+    return float(assignment.get("weight") or 0.0)
+
+
+def ticket_summary(ticket: Dict) -> str:
+    fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+    return str(fields.get("summary") or "").strip()
+
+
+def ticket_parent(ticket: Dict) -> Dict:
+    fields = ticket.get("fields") if isinstance(ticket.get("fields"), dict) else {}
+    parent = fields.get("parent")
+    return parent if isinstance(parent, dict) else {}
+
+
+def ticket_parent_key(ticket: Dict) -> str:
+    return str(ticket_parent(ticket).get("key") or "").strip()
+
+
+def ticket_parent_summary(ticket: Dict) -> str:
+    parent_fields = ticket_parent(ticket).get("fields")
+    if not isinstance(parent_fields, dict):
+        return ""
+    return str(parent_fields.get("summary") or "").strip()
+
+
+def ticket_lineage(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> List[Dict]:
+    lineage = [ticket]
+    seen = {str(ticket.get("key") or "").strip()}
+    current = ticket
+
+    while True:
+        parent_key = ticket_parent_key(current)
+        if not parent_key or parent_key in seen:
+            break
+
+        parent = tickets_by_key.get(parent_key)
+        if not parent:
+            embedded_summary = ticket_parent_summary(current)
+            if embedded_summary:
+                lineage.append({"key": parent_key, "fields": {"summary": embedded_summary}})
+            break
+
+        lineage.append(parent)
+        seen.add(parent_key)
+        current = parent
+
+    return lineage
+
+
+def is_dr_label(label: str) -> bool:
+    normalized = normalized_match_text(label)
+    return normalized in {"disaster recovery", "dr"}
+
+
+def dr_text_reason(summary: str) -> str:
+    raw = str(summary or "")
+    normalized = normalized_match_text(summary)
+    if not normalized:
+        return ""
+    if "disaster recovery" in normalized:
+        return "disaster recovery title"
+    if re.search(r"(^| )dr( |$)", normalized):
+        return "DR title"
+    if re.search(r"^\s*migrate\s*:", raw, re.IGNORECASE):
+        return "Migrate: title"
+    if normalized.startswith("migrate ") and (" to ecs" in normalized or " new aws account" in normalized):
+        return "migration title"
+    return ""
+
+
+def disaster_recovery_match_reasons(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> List[str]:
+    reasons: List[str] = []
+    lineage = ticket_lineage(ticket, tickets_by_key)
+
+    for item in lineage:
+        if any(is_dr_label(label) for label in ticket_labels(item)):
+            reasons.append("disaster-recovery label")
+            break
+
+    for idx, item in enumerate(lineage):
+        reason = dr_text_reason(ticket_summary(item))
+        if not reason:
+            continue
+        if idx == 0:
+            reasons.append(reason)
+        else:
+            reasons.append(f"parent {reason}")
+        break
+
+    assignee_weight = dr_engineer_weight(ticket)
+    if assignee_weight >= DR_STRONG_ASSIGNEE_WEIGHT:
+        reasons.append("100% DR assignee")
+
+    deduped: List[str] = []
+    seen = set()
+    for reason in reasons:
+        if reason in seen:
+            continue
+        seen.add(reason)
+        deduped.append(reason)
+    return deduped
+
+
+def select_disaster_recovery_tickets(all_tickets: List[Dict]) -> List[Dict]:
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
+    return [
+        ticket for ticket in all_tickets
+        if disaster_recovery_match_reasons(ticket, tickets_by_key)
+    ]
+
+
+def _clean_dr_service_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" -:")
+    cleaned = re.sub(r"\bAPI\b", "Api", cleaned)
+    aliases = {
+        "basket api": "Basket Api",
+        "context service api": "ContextServiceAPI",
+        "fulfilment service": "FulfilmentService",
+        "gateway app setup service api": "GatewayAppSetupServiceAPI",
+    }
+    return aliases.get(normalized_match_text(cleaned), cleaned)
+
+
+def _service_from_dr_summary(summary: str) -> str:
+    text = " ".join(str(summary or "").split())
+    if not text:
+        return ""
+
+    patterns = [
+        r"^Migrate:\s*(.*?)\s+(?:to|DR tasks\b)",
+        r"^Migrate\s+(.*?)\s+to\s+ECS\b",
+        r"^Migrate\s+(.*?)\s+to\s+new\s+AWS\s+account",
+        r"^(.*?)\s+DR\s+changes\b",
+        r"^(.*?)\s+cloud\s+migration\b",
+        r"^Remove SQL dependency in\s+(.*?)\s+-\s+Migration to Dynamo\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            service = _clean_dr_service_name(match.group(1))
+            if service:
+                return service
+
+    if re.search(r"\bBasket API\b", text, re.IGNORECASE):
+        return "Basket Api"
+    if re.search(r"\bDisaster Recovery Migration\b", text, re.IGNORECASE):
+        return "Programme-level DR"
+    return ""
+
+
+def disaster_recovery_service_name(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> str:
+    programme_level = ""
+    for item in reversed(ticket_lineage(ticket, tickets_by_key)):
+        service = _service_from_dr_summary(ticket_summary(item))
+        if service == "Programme-level DR":
+            programme_level = service
+            continue
+        if service:
+            return service
+
+    groups, _ = ticket_basic_groups(ticket, DEFAULT_BASIC_GROUP_FIELDS)
+    for group in groups:
+        cleaned = _clean_dr_service_name(group)
+        if cleaned and cleaned.lower() != "unassigned":
+            return cleaned
+
+    if any(is_dr_label(label) for label in ticket_labels(ticket)):
+        return "Programme-level DR"
+
+    return programme_level or "Unmapped service"
+
+
+def format_dr_ticket_summaries(tickets: List[Dict], limit: int = 4) -> str:
+    if not tickets:
+        return "none"
+
+    ordered = sorted(
+        tickets,
+        key=lambda ticket: (
+            str(ticket_fields(ticket).get("resolutiondate") or ""),
+            str(ticket_fields(ticket).get("updated") or ""),
+            str(ticket.get("key") or ""),
+        ),
+        reverse=True,
+    )
+    parts: List[str] = []
+    for ticket in ordered[:limit]:
+        key = str(ticket.get("key") or "").strip()
+        summary = clean_ticket_summary(ticket_summary(ticket))
+        label = f"{key} {summary}".strip()
+        if label:
+            parts.append(label)
+
+    if len(ordered) > limit:
+        parts.append(f"{len(ordered) - limit} more")
+
+    return "; ".join(parts) if parts else "none"
+
+
+def parse_github_datetime(raw: str) -> Optional[dt.datetime]:
+    if not raw:
+        return None
+    try:
+        return dt.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def pull_request_merged_at(pr: Dict) -> Optional[dt.datetime]:
+    pull_request = pr.get("pull_request") if isinstance(pr.get("pull_request"), dict) else {}
+    return parse_github_datetime(str(pull_request.get("merged_at") or ""))
+
+
+def pull_request_closed_at(pr: Dict) -> Optional[dt.datetime]:
+    return parse_github_datetime(str(pr.get("closed_at") or ""))
+
+
+def pull_request_created_at(pr: Dict) -> Optional[dt.datetime]:
+    return parse_github_datetime(str(pr.get("created_at") or ""))
+
+
+def pull_request_repo(pr: Dict) -> str:
+    repo_url = str(pr.get("repository_url") or "")
+    if "/repos/" in repo_url:
+        return repo_url.split("/repos/", 1)[1].split("/")[-1]
+    html_url = str(pr.get("html_url") or "")
+    match = re.search(r"github\.com/[^/]+/([^/]+)/pull/", html_url)
+    return match.group(1) if match else "unknown"
+
+
+def extract_jira_keys_from_text(value: str) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+    for match in re.finditer(r"\b([A-Z][A-Z0-9]+)-?(\d{4,6})\b", str(value or ""), re.IGNORECASE):
+        project = match.group(1).upper()
+        number = match.group(2)
+        if project not in {"ECOM", "PAY"}:
+            continue
+        key = f"ECOM-{number}" if project == "PAY" else f"{project}-{number}"
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def pull_request_text(pr: Dict) -> str:
+    return "\n".join([
+        str(pr.get("title") or ""),
+        str(pr.get("body") or ""),
+    ])
+
+
+def pull_request_dr_reason(pr: Dict, dr_ticket_keys: set) -> str:
+    text = pull_request_text(pr)
+    keys = extract_jira_keys_from_text(text)
+    if any(key in dr_ticket_keys for key in keys):
+        return "linked DR Jira ticket"
+
+    normalized = normalized_match_text(text)
+    if "disaster recovery" in normalized or re.search(r"(^| )dr( |$)", normalized):
+        return "DR PR text"
+    if " to ecs" in normalized or "dr workloads" in normalized or "new aws account" in normalized:
+        return "migration PR text"
+    return ""
+
+
+def pull_request_service_name(pr: Dict, tickets_by_key: Dict[str, Dict]) -> str:
+    keys = extract_jira_keys_from_text(pull_request_text(pr))
+    for key in keys:
+        ticket = tickets_by_key.get(key)
+        if ticket:
+            return disaster_recovery_service_name(ticket, tickets_by_key)
+
+    repo = pull_request_repo(pr)
+    repo_aliases = {
+        "BasketService": "Basket Api",
+        "BasketPricingService": "Basket Pricing Service",
+        "ContextService": "ContextServiceAPI",
+        "DeliveryOptionsService": "DeliveryOptionsService",
+        "FulfilmentService": "FulfilmentService",
+        "GatewayAppSetupService": "GatewayAppSetupServiceAPI",
+        "GatewayProductService": "Gateway Product Service",
+        "OrderProcessingService": "Order Service",
+    }
+    return repo_aliases.get(repo, repo)
+
+
+def median_float(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def format_hours_as_days(hours: Optional[float]) -> str:
+    if hours is None:
+        return "unavailable"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24.0:.1f}d"
 
 
 def ticket_resolution_name(ticket: Dict) -> str:
@@ -245,7 +621,10 @@ def chart_files(year: int, month: int) -> Dict[str, str]:
         "jira_team": os.path.join(REPORTS_DIR, f"jira_requesting_team_heatmap_{year}_{month:02d}.png"),
         "jira_flow_trend_vs": os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_{year}_{month:02d}.png"),
         "jira_flow_trend_vs_individual": os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_individual_{year}_{month:02d}.png"),
+        "jira_flow_trend_dr_individual": os.path.join(REPORTS_DIR, f"jira_flow_trend_dr_individual_{year}_{month:02d}.png"),
         "jira_flow_trend_ktlo": os.path.join(REPORTS_DIR, f"jira_flow_trend_ktlo_{year}_{month:02d}.png"),
+        "jira_backlog_overview": os.path.join(REPORTS_DIR, "jira_backlog_overview.png"),
+        "jira_backlog_balance": os.path.join(REPORTS_DIR, "jira_backlog_balance_weekday.png"),
     }
 
 
@@ -282,34 +661,76 @@ def load_prs(year: int, month: int, date_anchor: str = "created") -> List[Dict]:
     return [pr for pr in prs if str(pr.get(anchor_field) or "").startswith(target_month)]
 
 
-def load_internal_teams() -> Dict[str, List[str]]:
+def _parse_effective_date(raw: object) -> Optional[dt.date]:
+    if raw in (None, ""):
+        return None
+    try:
+        return dt.datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _normalize_team_mapping(teams_payload: object) -> Dict[str, List[str]]:
+    normalized: Dict[str, List[str]] = {}
+
+    if not isinstance(teams_payload, dict):
+        return normalized
+
+    for team_name, raw_users in teams_payload.items():
+        users = []
+        seen = set()
+        if not isinstance(raw_users, list):
+            continue
+        for user in raw_users:
+            login = str(user).strip()
+            if not login:
+                continue
+            key = login.lower()
+            if key in seen:
+                continue
+            users.append(login)
+            seen.add(key)
+        if users:
+            normalized[str(team_name).strip() or "Internal"] = users
+
+    return normalized
+
+
+def _select_effective_team_mapping(data: Dict, year: Optional[int], month: Optional[int]) -> Dict[str, List[str]]:
+    if year is None or month is None:
+        return {}
+
+    effective_on = dt.date(year, month, 1)
+    for team_set in data.get("team_sets") or []:
+        if not isinstance(team_set, dict):
+            continue
+        starts = _parse_effective_date(team_set.get("from"))
+        ends = _parse_effective_date(team_set.get("to"))
+        if starts and effective_on < starts:
+            continue
+        if ends and effective_on > ends:
+            continue
+        normalized = _normalize_team_mapping(team_set.get("internal_teams"))
+        if normalized:
+            return normalized
+
+    return {}
+
+
+def load_internal_teams(year: Optional[int] = None, month: Optional[int] = None) -> Dict[str, List[str]]:
     data = read_json(INTERNAL_TEAM_FILE)
     if not data:
         legacy = "data/config/github-internal-team.json"
         if os.path.exists(legacy):
             data = read_json(legacy)
 
+    if isinstance(data, dict):
+        normalized = _select_effective_team_mapping(data, year, month)
+        if normalized:
+            return normalized
+
     teams_payload = data.get("internal_teams") if isinstance(data, dict) else None
-    normalized: Dict[str, List[str]] = {}
-
-    if isinstance(teams_payload, dict):
-        for team_name, raw_users in teams_payload.items():
-            users = []
-            seen = set()
-            if not isinstance(raw_users, list):
-                continue
-            for user in raw_users:
-                login = str(user).strip()
-                if not login:
-                    continue
-                key = login.lower()
-                if key in seen:
-                    continue
-                users.append(login)
-                seen.add(key)
-            if users:
-                normalized[str(team_name).strip() or "Internal"] = users
-
+    normalized = _normalize_team_mapping(teams_payload)
     if normalized:
         return normalized
 
@@ -464,7 +885,7 @@ def github_pr_split_stats(year: int, month: int) -> Optional[Dict[str, object]]:
     except SystemExit:
         return None
 
-    internal_teams = load_internal_teams()
+    internal_teams = load_internal_teams(year, month)
     if not internal_teams:
         return None
 
@@ -657,6 +1078,354 @@ def is_pr_like_ticket(ticket: Dict) -> bool:
     return issue_type.startswith("pr ") or issue_type.endswith(" pr")
 
 
+def ticket_fields(ticket: Dict) -> Dict:
+    fields = ticket.get("fields")
+    return fields if isinstance(fields, dict) else {}
+
+
+def format_inline_code(value: str) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return ""
+    return f"`{cleaned.replace('`', '')}`"
+
+
+def format_ticket_count(count: int) -> str:
+    unit = "ticket" if count == 1 else "tickets"
+    return f"{count} {unit}"
+
+
+def unique_preserving_order(values: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+    return result
+
+
+def extract_description_repositories(ticket: Dict) -> List[str]:
+    raw = json.dumps(ticket_fields(ticket).get("description") or {})
+    repos = [
+        match.group(1).strip().rstrip("/")
+        for match in re.finditer(r"https?://github\.com/[^/\"\s]+/([^/\"#?\s]+)", raw, re.IGNORECASE)
+    ]
+    return unique_preserving_order(repos)
+
+
+def clean_ticket_summary(summary: str) -> str:
+    cleaned = " ".join(str(summary or "").split())
+    cleaned = re.sub(r"^\[PR\]\s*[-:]?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^PR\s*[-:]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^PR\s+Review\s*[-:]?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^[A-Z]{2,8}\s+PR\s+Review\s*[-:]?\s*", "", cleaned)
+    cleaned = re.sub(r"^Review\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" -:")
+
+
+def summarize_ticket_themes(tickets: List[Dict]) -> str:
+    summaries = unique_preserving_order([
+        clean_ticket_summary(str(ticket_fields(ticket).get("summary") or ""))
+        for ticket in tickets
+    ])
+    if not summaries:
+        return "current-month PR work"
+
+    shown = summaries[:3]
+    if len(summaries) > len(shown):
+        shown.append(f"{len(summaries) - len(shown)} more")
+
+    if len(shown) == 1:
+        return f"work on {shown[0]}"
+    return "work covering " + "; ".join(shown)
+
+
+def current_month_created_pr_tickets(tickets: List[Dict], year: int, month: int) -> List[Dict]:
+    target_month = f"{year}-{month:02d}"
+    return [
+        ticket for ticket in tickets
+        if is_pr_like_ticket(ticket)
+        and str(ticket_fields(ticket).get("created") or "").startswith(target_month)
+    ]
+
+
+def ticket_lead_time_days(ticket: Dict) -> Optional[float]:
+    fields = ticket_fields(ticket)
+    created = parse_jira_datetime(str(fields.get("created") or ""))
+    resolved = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+    if created is None or resolved is None:
+        return None
+    delta = (resolved - created).total_seconds()
+    if delta < 0:
+        return None
+    return delta / 86400.0
+
+
+def build_requesting_team_impact_summary(all_tickets: List[Dict], year: int, month: int) -> List[str]:
+    pr_tickets = current_month_created_pr_tickets(all_tickets, year, month)
+    if not pr_tickets:
+        return []
+
+    normalized_payload = derive_normalized_tickets(pr_tickets, year, month, "created")
+    normalized_by_key = {
+        str(ticket.get("key") or ""): ticket
+        for ticket in normalized_payload.get("tickets", [])
+        if str(ticket.get("key") or "")
+    }
+
+    tickets_by_team: Dict[str, List[Dict]] = {}
+    for ticket in pr_tickets:
+        normalized = normalized_by_key.get(str(ticket.get("key") or ""), {})
+        team = str(normalized.get("requesting_team_effective") or "").strip()
+        if not team:
+            continue
+        tickets_by_team.setdefault(team, []).append(ticket)
+
+    total = sum(len(team_tickets) for team_tickets in tickets_by_team.values())
+    if total == 0:
+        return []
+
+    ranked_teams = sorted(tickets_by_team.items(), key=lambda item: (-len(item[1]), item[0].lower()))[:3]
+    service_overrides = _load_service_overrides()
+    service_aliases, canonical_services = _service_alias_map()
+
+    month_label = dt.date(year, month, 1).strftime("%B %Y")
+    lines = [
+        "## Current Month Requesting-Team Impact Summary",
+        "",
+        f"_Basis: Jira PR tickets created in {month_label}; percentages use tickets with usable requesting-team values; ties sort by team name._",
+        "",
+    ]
+
+    for team, team_tickets in ranked_teams:
+        closed_tickets = [
+            ticket for ticket in team_tickets
+            if parse_jira_datetime(str(ticket_fields(ticket).get("resolutiondate") or ""))
+        ]
+        active_count = len(team_tickets) - len(closed_tickets)
+        lead_times = [
+            days for days in (ticket_lead_time_days(ticket) for ticket in closed_tickets)
+            if days is not None
+        ]
+
+        repo_values: List[str] = []
+        for ticket in team_tickets:
+            groups, _ = ticket_basic_groups(ticket, DEFAULT_BASIC_GROUP_FIELDS)
+            for group in groups:
+                repo_values.append(normalize_service_name(group, service_overrides, service_aliases, canonical_services))
+            repo_values.extend(extract_description_repositories(ticket))
+
+        repos = unique_preserving_order(repo_values)
+        repo_phrase = ""
+        if repos:
+            shown_repos = repos[:10]
+            repo_phrase = " across " + ", ".join(format_inline_code(repo) for repo in shown_repos if repo)
+            if len(repos) > len(shown_repos):
+                repo_phrase += f", and {len(repos) - len(shown_repos)} more"
+
+        average_lead = "unavailable"
+        if lead_times:
+            average_lead = f"{sum(lead_times) / len(lead_times):.2f} days"
+
+        pct = len(team_tickets) / total * 100
+        lines.extend([
+            f"- {format_inline_code(team)}: {format_ticket_count(len(team_tickets))}, {pct:.1f}% of total.\\",
+            (
+                f"  Impact: {summarize_ticket_themes(team_tickets)}{repo_phrase}. "
+                f"{len(closed_tickets)} closed, {active_count} active. "
+                f"Avg Lead time: {average_lead}."
+            ),
+            "",
+        ])
+
+    return lines
+
+
+def build_disaster_recovery_summary(all_tickets: List[Dict], year: int, month: int) -> List[str]:
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
+    dr_tickets = select_disaster_recovery_tickets(all_tickets)
+    window_start, window_end = month_window(year, month)
+    resolved_dr_tickets = resolved_tickets_in_window(dr_tickets, window_start, window_end)
+
+    service_buckets: Dict[str, List[Dict]] = {}
+    for ticket in resolved_dr_tickets:
+        service = disaster_recovery_service_name(ticket, tickets_by_key)
+        service_buckets.setdefault(service, []).append(ticket)
+
+    month_label = dt.date(year, month, 1).strftime("%B %Y")
+    lines = [
+        "## Disaster Recovery Work",
+        "",
+        (
+            f"_Basis: explicit DR tickets resolved in {month_label}. "
+            "Explicit DR means disaster-recovery label, DR/Disaster Recovery/Migrate: title in the ticket or parent hierarchy, "
+            "or assignment to a 100% DR engineer._"
+        ),
+        "",
+    ]
+
+    if not service_buckets:
+        lines.extend(["No completed DR work found for this reporting window.", ""])
+    else:
+        total_resolved = sum(len(tickets) for tickets in service_buckets.values())
+        lines.extend([f"**Done:** {total_resolved} resolved DR ticket(s) across {len(service_buckets)} service group(s).", ""])
+        ranked_services = sorted(
+            service_buckets.items(),
+            key=lambda item: (-len(item[1]), item[0].lower()),
+        )
+        for service, resolved in ranked_services:
+            lines.extend([
+                f"- **{service}**: {format_dr_ticket_summaries(resolved)}.",
+            ])
+        lines.append("")
+
+    return lines
+
+
+def build_disaster_recovery_pr_review_summary(all_tickets: List[Dict], year: int, month: int) -> List[str]:
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
+    dr_ticket_keys = {
+        str(ticket.get("key") or "").strip()
+        for ticket in select_disaster_recovery_tickets(all_tickets)
+        if str(ticket.get("key") or "").strip()
+    }
+
+    try:
+        prs = load_prs(year, month, date_anchor="created")
+    except SystemExit:
+        return [
+            "### DR PR Review Bottleneck",
+            "",
+            "_Unavailable: GitHub PR cache missing for this month._",
+            "",
+        ]
+
+    dr_prs = [
+        pr for pr in prs
+        if pull_request_dr_reason(pr, dr_ticket_keys)
+    ]
+    if not dr_prs:
+        return [
+            "### DR PR Review Bottleneck",
+            "",
+            "_No DR-linked PRs found in this month’s GitHub cache._",
+            "",
+        ]
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    _, month_end = month_window(year, month)
+    age_reference = min(now_utc, month_end)
+
+    merged_durations: List[float] = []
+    open_prs: List[Tuple[float, Dict]] = []
+    closed_unmerged_count = 0
+    service_buckets: Dict[str, Dict[str, object]] = {}
+
+    for pr in dr_prs:
+        created = pull_request_created_at(pr)
+        if created is None:
+            continue
+
+        service = pull_request_service_name(pr, tickets_by_key)
+        bucket = service_buckets.setdefault(service, {"merged_hours": [], "open": []})
+
+        merged = pull_request_merged_at(pr)
+        if merged is not None:
+            hours = (merged - created).total_seconds() / 3600.0
+            if hours >= 0:
+                merged_durations.append(hours)
+                bucket["merged_hours"].append(hours)
+            continue
+
+        if str(pr.get("state") or "").lower() == "open":
+            age_hours = max(0.0, (age_reference - created).total_seconds() / 3600.0)
+            open_prs.append((age_hours, pr))
+            bucket["open"].append((age_hours, pr))
+        elif pull_request_closed_at(pr) is not None:
+            closed_unmerged_count += 1
+
+    merged_count = len(merged_durations)
+    open_count = len(open_prs)
+    slow_open = [(age, pr) for age, pr in open_prs if age >= 24.0]
+    median_merge = median_float(merged_durations)
+    oldest_open = max(open_prs, key=lambda item: item[0]) if open_prs else None
+
+    lines = [
+        "### DR PR Review Bottleneck",
+        "",
+        (
+            f"_Basis: DR-linked GitHub PRs created in {dt.date(year, month, 1).strftime('%B %Y')}; "
+            "duration is PR created to merged, with open PR age as the bottleneck signal._"
+        ),
+        "",
+        (
+            f"**Signal:** {len(dr_prs)} DR PR(s), {merged_count} merged, {open_count} still open. "
+            f"Median merge time: {format_hours_as_days(median_merge)}. "
+            f"Open longer than 1 day: {len(slow_open)}."
+        ),
+        "",
+    ]
+    if closed_unmerged_count:
+        lines.extend([f"_Closed without merge: {closed_unmerged_count} DR PR(s)._", ""])
+
+    if oldest_open:
+        age_hours, pr = oldest_open
+        lines.extend([
+            (
+                "**Oldest open DR PR:** "
+                f"{pull_request_repo(pr)} #{pr.get('number')} "
+                f"({format_hours_as_days(age_hours)} open) - {markdown_table_cell(pr.get('title') or '')}"
+            ),
+            "",
+        ])
+
+    service_rows = []
+    for service, bucket in service_buckets.items():
+        merged_hours = bucket.get("merged_hours") if isinstance(bucket.get("merged_hours"), list) else []
+        open_items = bucket.get("open") if isinstance(bucket.get("open"), list) else []
+        service_rows.append((
+            service,
+            len(merged_hours),
+            len(open_items),
+            median_float(merged_hours),
+            max((float(item[0]) for item in open_items), default=None),
+        ))
+
+    lines.extend([
+        "| Service | Merged PRs | Open PRs | Median merge | Oldest open |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ])
+    for service, merged, open_total, median_hours, oldest_hours in sorted(
+        service_rows,
+        key=lambda row: (-row[2], -(row[4] or 0.0), row[0].lower()),
+    ):
+        lines.append(
+            "| "
+            f"{markdown_table_cell(service)} | "
+            f"{merged} | "
+            f"{open_total} | "
+            f"{format_hours_as_days(median_hours)} | "
+            f"{format_hours_as_days(oldest_hours)} |"
+        )
+    lines.append("")
+
+    return lines
+
+
 def resolved_tickets_in_window(tickets: List[Dict], window_start: dt.datetime, window_end: dt.datetime) -> List[Dict]:
     selected: List[Dict] = []
     for ticket in tickets:
@@ -779,6 +1548,11 @@ def build_report(year: int, month: int, report_dir: str) -> str:
     metric_sections: List[Dict[str, object]] = []
     longest_lead: Optional[Dict[str, object]] = None
     longest_cycle: Optional[Dict[str, object]] = None
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
 
     groups = policy.get("groups") if isinstance(policy.get("groups"), list) else []
     for idx, group in enumerate(groups):
@@ -787,6 +1561,8 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         group_id = str(group.get("id") or "").strip().lower()
         label = str(group.get("label") or "Group")
         group_tickets = select_group_tickets(all_tickets, group)
+        if group_id == "disaster_recovery" or label.strip().lower() in {"disaster recovery", "dr"}:
+            group_tickets = select_disaster_recovery_tickets(all_tickets)
 
         if group_id == "ktlo" or label.strip().lower() == "ktlo":
             excluded_resolutions = {"wont do", "duplicate"}
@@ -854,6 +1630,34 @@ def build_report(year: int, month: int, report_dir: str) -> str:
                 filtered_type_cycle_durations, _ = filter_iqr_outliers(type_cycle_durations)
                 append_metric_rows(filtered_section_rows, issue_type, filtered_type_lead_durations, filtered_type_cycle_durations, suffix, level=1)
 
+        if group_id == "disaster_recovery" or label.strip().lower() in {"disaster recovery", "dr"}:
+            service_buckets: Dict[str, List[Dict]] = {}
+            for ticket in group_tickets:
+                service = disaster_recovery_service_name(ticket, tickets_by_key)
+                service_buckets.setdefault(service, []).append(ticket)
+
+            ranked_services = sorted(
+                service_buckets.items(),
+                key=lambda item: (-len(jira_lead_stats_in_window(item[1], window_start, window_end, validity)[0]), item[0].lower()),
+            )
+            for service, service_tickets in ranked_services:
+                service_lead_durations, _ = jira_lead_stats_in_window(service_tickets, window_start, window_end, validity)
+                service_cycle_durations, _ = jira_cycle_stats_in_window(service_tickets, window_start, window_end, validity)
+                if not service_lead_durations and not service_cycle_durations:
+                    continue
+                append_metric_rows(section_rows, service, service_lead_durations, service_cycle_durations, suffix, level=1)
+
+                filtered_service_lead_durations, _ = filter_iqr_outliers(service_lead_durations)
+                filtered_service_cycle_durations, _ = filter_iqr_outliers(service_cycle_durations)
+                append_metric_rows(
+                    filtered_section_rows,
+                    service,
+                    filtered_service_lead_durations,
+                    filtered_service_cycle_durations,
+                    suffix,
+                    level=1,
+                )
+
         metric_sections.append({
             "id": group_id,
             "label": label,
@@ -905,6 +1709,9 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         "",
         "### Flow Trend (Individual PR Lead Time)",
         image_block(jira_flow_trend_vs_individual_chart, f"Vertical Support Individual PR Lead Time {month_label}", report_dir),
+        "",
+        "### KTLO Backlog Trend",
+        image_block(charts["jira_backlog_balance"], "Jira KTLO Backlog Balance", report_dir),
         "",
         "| Type | Lead Time (avg.) | Cycle Time (avg.) |",
         "| --- | --- | --- |",
@@ -964,6 +1771,14 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         lines.extend([stat_line, ""])
 
     lines.extend([
+        "## Disaster Recovery Lead Time",
+        "",
+        image_block(charts["jira_flow_trend_dr_individual"], f"Disaster Recovery Lead Time {month_label}", report_dir),
+        "",
+    ])
+    lines.extend(build_disaster_recovery_summary(all_tickets, year, month))
+
+    lines.extend([
         longest_lead_line,
         "",
         longest_cycle_line,
@@ -985,6 +1800,8 @@ def build_report(year: int, month: int, report_dir: str) -> str:
         image_block(charts["jira_team"], f"Jira Requesting Team Heatmap {month_label}", report_dir),
         "",
     ])
+
+    lines.extend(build_requesting_team_impact_summary(all_tickets, year, month))
 
     return "\n".join(lines)
 

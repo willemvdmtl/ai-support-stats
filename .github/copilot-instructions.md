@@ -22,3 +22,10 @@
   - reusable
   - deterministic
   - clear step separation (setup, fetch, generate, report)
+
+## Response Style
+
+- Default to concise answers.
+- For simple changes, prefer a short confirmation plus validation result.
+- Only include detailed explanation when explicitly requested or when needed to avoid ambiguity.
+- Keep progress updates minimal and focused on what changed next.

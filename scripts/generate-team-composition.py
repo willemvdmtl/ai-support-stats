@@ -28,6 +28,7 @@ from generate.team_composition import (
     build_timeline,
     build_membership_summary,
     build_monthly_roster_from_summary,
+    compute_threshold_active_months,
     diff,
     extract_assignees,
     load_saved,
@@ -38,6 +39,7 @@ from generate.team_composition import (
     write_team_split_excel,
     write_timeline,
     write_timeline_svg,
+    write_threshold_preview_svg,
 )
 
 
@@ -74,6 +76,17 @@ def parse_args(argv=None):
         "--team-split",
         action="store_true",
         help="Build separate Excel file with fixed vs floating headcount by month",
+    )
+    group.add_argument(
+        "--threshold-preview",
+        metavar="N",
+        type=int,
+        nargs="?",
+        const=3,
+        help=(
+            "Generate a diagnostic SVG showing the effect of a per-month event "
+            "threshold (default: 3). Red = would be excluded; green = would be included."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -163,6 +176,10 @@ def main(argv=None) -> None:
         excluded = set(corrections.get("exclude_names") or [])
         assignment_cfg = corrections.get("assignment_timeline") or {}
         min_events = int(assignment_cfg.get("min_events") or 5)
+        per_month_threshold = int(assignment_cfg.get("per_month_threshold") or 3)
+        departure_window = int(assignment_cfg.get("departure_window") or 2)
+        join_window = int(assignment_cfg.get("join_window") or 1)
+        overrides = assignment_cfg.get("overrides") or {}
         member_timeline = build_assignment_timeline(
             months,
             exclude_names=excluded,
@@ -172,36 +189,40 @@ def main(argv=None) -> None:
         if not member_timeline:
             print("ERROR: No assignment changelog data found for visual generation.")
             sys.exit(1)
-        excluded_hint = ", ".join(sorted(excluded)) if excluded else "none"
-        summary = build_membership_summary(
-            months + ["2026-07"],
-            exclude_names=excluded,
-            inactivity_threshold=3,
-            corrections=corrections,
-        )
-        monthly_rows = build_monthly_roster_from_summary(summary)
-        member_names = [member["displayName"] for member in member_timeline]
+        # Build threshold-filtered active months per person
         timeline = []
-        for name in member_names:
-            active_months = [row["month"] for row in monthly_rows if name in row["roster"]]
+        for member in member_timeline:
+            active_months = sorted(compute_threshold_active_months(
+                member, months, per_month_threshold, departure_window, join_window, overrides
+            ))
             if not active_months:
                 continue
             timeline.append(
                 {
-                    "displayName": name,
+                    "displayName": member["displayName"],
                     "first_seen": active_months[0],
                     "last_seen": active_months[-1],
                     "months_active": active_months,
-                    "events": next((member["events"] for member in member_timeline if member["displayName"] == name), 0),
+                    "events": member.get("events", 0),
                 }
             )
+        # Derive headcount per month from threshold-filtered data
+        monthly_rows = [
+            {
+                "month": month,
+                "headcount": sum(1 for m in timeline if month in m["months_active"]),
+            }
+            for month in months
+        ]
+        excluded_hint = ", ".join(sorted(excluded)) if excluded else "none"
         path = write_timeline_svg(
             months,
             timeline,
             title="Assignment Timeline",
             subtitle=(
                 f"Assignee-change events by month from {months[0]} to {months[-1]} "
-                f"(excluded: {excluded_hint}; min {min_events} assignments)"
+                f"(excluded: {excluded_hint}; min {min_events} assignments; "
+                f"per-month threshold: {per_month_threshold})"
             ),
             monthly_rows=monthly_rows,
         )
@@ -283,7 +304,72 @@ def main(argv=None) -> None:
         print(f"Written: {path}")
         return
 
-    # --all
+    if args.threshold_preview is not None:
+        threshold = args.threshold_preview
+        months = manifest_months()
+        if not months:
+            print("ERROR: No months found in Jira manifest.")
+            sys.exit(1)
+        corrections = load_corrections()
+        excluded = set(corrections.get("exclude_names") or [])
+        assignment_cfg = corrections.get("assignment_timeline") or {}
+        preview_overrides = assignment_cfg.get("overrides") or {}
+        min_events = int(assignment_cfg.get("min_events") or 5)
+        member_timeline = build_assignment_timeline(
+            months,
+            exclude_names=excluded,
+            min_events=min_events,
+            corrections=corrections,
+        )
+        if not member_timeline:
+            print("ERROR: No assignment changelog data found.")
+            sys.exit(1)
+        summary = build_membership_summary(
+            months + ["2026-07"],
+            exclude_names=excluded,
+            inactivity_threshold=3,
+            corrections=corrections,
+        )
+        monthly_rows = build_monthly_roster_from_summary(summary)
+        current_roster_by_month = {row["month"]: set(row["roster"]) for row in monthly_rows}
+        # Build timeline list (same people/order as --visual)
+        preview_timeline = []
+        for member in member_timeline:
+            name = member["displayName"]
+            # Include if they appear in current roster OR would appear under new rules
+            current_months = [m for m in months if name in current_roster_by_month.get(m, set())]
+            new_months = compute_threshold_active_months(
+                member,
+                months,
+                threshold,
+                2,
+                1,
+                preview_overrides,
+            )
+            if not current_months and not new_months:
+                continue
+            preview_timeline.append(member)
+        path = write_threshold_preview_svg(
+            months,
+            preview_timeline,
+            current_roster_by_month=current_roster_by_month,
+            per_month_threshold=threshold,
+            departure_window=2,
+            join_window=1,
+            preview_overrides=preview_overrides,
+            title="Team Composition — Threshold Preview",
+            subtitle=(
+                f"Per-month threshold: {threshold} events  |  "
+                f"Departure window: 2mo (non-zero), 1mo (zero-event)  |  Join window: 1mo  |  "
+                f"Red = would exclude  |  Green = would include"
+            ),
+            monthly_rows=monthly_rows,
+        )
+        print(f"Threshold preview — {len(preview_timeline)} members, threshold={threshold} ({months[0]} → {months[-1]})")
+        print(f"Written: {path}")
+        return
+
+
     months = manifest_months()
     if not months:
         print("ERROR: No months found in Jira manifest.")

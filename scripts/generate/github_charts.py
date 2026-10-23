@@ -51,34 +51,76 @@ def load_prs(year: int, month: int, date_anchor: str = "created") -> List[Dict]:
     return [pr for pr in prs if str(pr.get(anchor_field) or "").startswith(target_month)]
 
 
-def load_internal_teams() -> Dict[str, List[str]]:
+def _parse_effective_date(raw: object) -> Optional[dt.date]:
+    if raw in (None, ""):
+        return None
+    try:
+        return dt.datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _normalize_team_mapping(teams_payload: object) -> Dict[str, List[str]]:
+    normalized: Dict[str, List[str]] = {}
+
+    if not isinstance(teams_payload, dict):
+        return normalized
+
+    for team_name, raw_users in teams_payload.items():
+        users = []
+        seen = set()
+        if not isinstance(raw_users, list):
+            continue
+        for user in raw_users:
+            login = str(user).strip()
+            if not login:
+                continue
+            key = login.lower()
+            if key in seen:
+                continue
+            users.append(login)
+            seen.add(key)
+        if users:
+            normalized[str(team_name).strip() or "Internal"] = users
+
+    return normalized
+
+
+def _select_effective_team_mapping(data: Dict, year: Optional[int], month: Optional[int]) -> Dict[str, List[str]]:
+    if year is None or month is None:
+        return {}
+
+    effective_on = dt.date(year, month, 1)
+    for team_set in data.get("team_sets") or []:
+        if not isinstance(team_set, dict):
+            continue
+        starts = _parse_effective_date(team_set.get("from"))
+        ends = _parse_effective_date(team_set.get("to"))
+        if starts and effective_on < starts:
+            continue
+        if ends and effective_on > ends:
+            continue
+        normalized = _normalize_team_mapping(team_set.get("internal_teams"))
+        if normalized:
+            return normalized
+
+    return {}
+
+
+def load_internal_teams(year: Optional[int] = None, month: Optional[int] = None) -> Dict[str, List[str]]:
     data = read_json(INTERNAL_TEAM_FILE)
     if not data:
         legacy = "data/config/github-internal-team.json"
         if os.path.exists(legacy):
             data = read_json(legacy)
 
+    if isinstance(data, dict):
+        normalized = _select_effective_team_mapping(data, year, month)
+        if normalized:
+            return normalized
+
     teams_payload = data.get("internal_teams") if isinstance(data, dict) else None
-    normalized: Dict[str, List[str]] = {}
-
-    if isinstance(teams_payload, dict):
-        for team_name, raw_users in teams_payload.items():
-            users = []
-            seen = set()
-            if not isinstance(raw_users, list):
-                continue
-            for user in raw_users:
-                login = str(user).strip()
-                if not login:
-                    continue
-                key = login.lower()
-                if key in seen:
-                    continue
-                users.append(login)
-                seen.add(key)
-            if users:
-                normalized[str(team_name).strip() or "Internal"] = users
-
+    normalized = _normalize_team_mapping(teams_payload)
     if normalized:
         return normalized
 
@@ -351,8 +393,10 @@ def generate_split_bar(prs: List[Dict], year: int, month: int, internal_teams: D
     colours = [PALETTE["sky"], PALETTE["teal"], PALETTE["purple"], PALETTE["peach"]]
     segments = []
     for index, (team_name, count) in enumerate(sorted(team_counts.items(), key=lambda item: item[1], reverse=True)):
-        segments.append((f"Internal ({team_name})", count, colours[index % len(colours)]))
-    segments.append(("External", external_count, PALETTE["mint"]))
+        if count > 0:
+            segments.append((f"Internal ({team_name})", count, colours[index % len(colours)]))
+    if external_count > 0:
+        segments.append(("External", external_count, PALETTE["mint"]))
     segments.sort(key=lambda s: s[1], reverse=True)
 
     fig, ax = plt.subplots(figsize=(10, 2.8))
@@ -372,7 +416,16 @@ def generate_split_bar(prs: List[Dict], year: int, month: int, internal_teams: D
     ax.set_xlim(0, max(total, 1))
     ax.set_xticks([])
     ax.grid(False)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.45), ncol=3, frameon=False)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.45),
+            ncol=min(3, len(handles)),
+            frameon=False,
+        )
 
     plt.tight_layout()
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -419,7 +472,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if do_split:
         print("\nInternal / external split:")
-        internal_teams = load_internal_teams()
+        internal_teams = load_internal_teams(year, month)
         out = generate_split_bar(prs, year, month, internal_teams)
         if out:
             print(f"  Saved: {out}")

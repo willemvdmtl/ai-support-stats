@@ -10,6 +10,7 @@ import math
 import os
 import re
 import sys
+import unicodedata
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +32,15 @@ DEFAULT_BASIC_GROUP_FIELDS: List[Tuple[str, str]] = [
 ]
 METRIC_GROUPS_CONFIG_FILE = "config/jira-metric-groups.json"
 OUTLIER_IQR_MULTIPLIER = 5.0
+DR_ENGINEER_ASSIGNMENTS = {
+    "ayman rezzou": {"weight": 1.0},
+    "evangelos aktoudianakis": {"weight": 1.0},
+    "marta ludovico": {"weight": 0.5},
+    "marcal montserrat cantos": {"weight": 0.5},
+    "john papin": {"weight": 1.0, "from": "2026-10-09"},
+    "john pappin": {"weight": 1.0, "from": "2026-10-09"},
+}
+DR_STRONG_ASSIGNEE_WEIGHT = 1.0
 
 
 def load_heatmap_date_anchor() -> str:
@@ -102,6 +112,203 @@ def ticket_labels(ticket: Dict) -> set:
     fields = ticket_fields(ticket)
     labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
     return {str(label).strip().lower() for label in labels if str(label).strip()}
+
+
+def normalized_match_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_value.lower()).strip()
+
+
+def ticket_summary(ticket: Dict) -> str:
+    return str(ticket_fields(ticket).get("summary") or "").strip()
+
+
+def ticket_assignee_name(ticket: Dict) -> str:
+    fields = ticket_fields(ticket)
+    assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+    return str(assignee.get("displayName") or assignee.get("name") or "").strip()
+
+
+def ticket_activity_date(ticket: Dict) -> Optional[dt.date]:
+    fields = ticket_fields(ticket)
+    for field_name in ("resolutiondate", "updated", "created"):
+        parsed = parse_jira_datetime(str(fields.get(field_name) or ""))
+        if parsed is not None:
+            return parsed.date()
+    return None
+
+
+def dr_engineer_weight(ticket: Dict) -> float:
+    assignment = DR_ENGINEER_ASSIGNMENTS.get(normalized_match_text(ticket_assignee_name(ticket)))
+    if not assignment:
+        return 0.0
+
+    effective_from = str(assignment.get("from") or "").strip()
+    if effective_from:
+        activity_date = ticket_activity_date(ticket)
+        try:
+            starts = dt.datetime.strptime(effective_from, "%Y-%m-%d").date()
+        except ValueError:
+            starts = None
+        if starts is not None and activity_date is not None and activity_date < starts:
+            return 0.0
+
+    return float(assignment.get("weight") or 0.0)
+
+
+def ticket_parent(ticket: Dict) -> Dict:
+    parent = ticket_fields(ticket).get("parent")
+    return parent if isinstance(parent, dict) else {}
+
+
+def ticket_parent_key(ticket: Dict) -> str:
+    return str(ticket_parent(ticket).get("key") or "").strip()
+
+
+def ticket_parent_summary(ticket: Dict) -> str:
+    parent_fields = ticket_parent(ticket).get("fields")
+    if not isinstance(parent_fields, dict):
+        return ""
+    return str(parent_fields.get("summary") or "").strip()
+
+
+def ticket_lineage(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> List[Dict]:
+    lineage = [ticket]
+    seen = {str(ticket.get("key") or "").strip()}
+    current = ticket
+
+    while True:
+        parent_key = ticket_parent_key(current)
+        if not parent_key or parent_key in seen:
+            break
+        parent = tickets_by_key.get(parent_key)
+        if not parent:
+            embedded_summary = ticket_parent_summary(current)
+            if embedded_summary:
+                lineage.append({"key": parent_key, "fields": {"summary": embedded_summary}})
+            break
+        lineage.append(parent)
+        seen.add(parent_key)
+        current = parent
+
+    return lineage
+
+
+def is_dr_label(label: str) -> bool:
+    return normalized_match_text(label) in {"disaster recovery", "dr"}
+
+
+def dr_text_reason(summary: str) -> str:
+    raw = str(summary or "")
+    normalized = normalized_match_text(summary)
+    if not normalized:
+        return ""
+    if "disaster recovery" in normalized:
+        return "disaster recovery title"
+    if re.search(r"(^| )dr( |$)", normalized):
+        return "DR title"
+    if re.search(r"^\s*migrate\s*:", raw, re.IGNORECASE):
+        return "Migrate: title"
+    if normalized.startswith("migrate ") and (" to ecs" in normalized or " new aws account" in normalized):
+        return "migration title"
+    return ""
+
+
+def disaster_recovery_match_reasons(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> List[str]:
+    reasons: List[str] = []
+    lineage = ticket_lineage(ticket, tickets_by_key)
+
+    for item in lineage:
+        if any(is_dr_label(label) for label in ticket_labels(item)):
+            reasons.append("disaster-recovery label")
+            break
+
+    for idx, item in enumerate(lineage):
+        reason = dr_text_reason(ticket_summary(item))
+        if not reason:
+            continue
+        reasons.append(reason if idx == 0 else f"parent {reason}")
+        break
+
+    assignee_weight = dr_engineer_weight(ticket)
+    if assignee_weight >= DR_STRONG_ASSIGNEE_WEIGHT:
+        reasons.append("100% DR assignee")
+
+    return list(dict.fromkeys(reasons))
+
+
+def select_disaster_recovery_tickets(all_tickets: List[Dict]) -> List[Dict]:
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
+    return [
+        ticket for ticket in all_tickets
+        if disaster_recovery_match_reasons(ticket, tickets_by_key)
+    ]
+
+
+def _clean_dr_service_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" -:")
+    cleaned = re.sub(r"\bAPI\b", "Api", cleaned)
+    aliases = {
+        "basket api": "Basket Api",
+        "context service api": "ContextServiceAPI",
+        "fulfilment service": "FulfilmentService",
+        "gateway app setup service api": "GatewayAppSetupServiceAPI",
+    }
+    return aliases.get(normalized_match_text(cleaned), cleaned)
+
+
+def _service_from_dr_summary(summary: str) -> str:
+    text = " ".join(str(summary or "").split())
+    if not text:
+        return ""
+
+    patterns = [
+        r"^Migrate:\s*(.*?)\s+(?:to|DR tasks\b)",
+        r"^Migrate\s+(.*?)\s+to\s+ECS\b",
+        r"^Migrate\s+(.*?)\s+to\s+new\s+AWS\s+account",
+        r"^(.*?)\s+DR\s+changes\b",
+        r"^(.*?)\s+cloud\s+migration\b",
+        r"^Remove SQL dependency in\s+(.*?)\s+-\s+Migration to Dynamo\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            service = _clean_dr_service_name(match.group(1))
+            if service:
+                return service
+
+    if re.search(r"\bBasket API\b", text, re.IGNORECASE):
+        return "Basket Api"
+    if re.search(r"\bDisaster Recovery Migration\b", text, re.IGNORECASE):
+        return "Programme-level DR"
+    return ""
+
+
+def disaster_recovery_service_name(ticket: Dict, tickets_by_key: Dict[str, Dict]) -> str:
+    programme_level = ""
+    for item in reversed(ticket_lineage(ticket, tickets_by_key)):
+        service = _service_from_dr_summary(ticket_summary(item))
+        if service == "Programme-level DR":
+            programme_level = service
+            continue
+        if service:
+            return service
+
+    groups, _ = ticket_basic_groups(ticket, DEFAULT_BASIC_GROUP_FIELDS)
+    for group in groups:
+        cleaned = _clean_dr_service_name(group)
+        if cleaned and cleaned.lower() != "unassigned":
+            return cleaned
+
+    if any(is_dr_label(label) for label in ticket_labels(ticket)):
+        return "Programme-level DR"
+
+    return programme_level or "Unmapped service"
 
 
 def is_vertical_support_ticket(ticket: Dict, issue_types: set, tags: set) -> bool:
@@ -592,6 +799,58 @@ def jira_lead_durations_by_ticket_in_window(
     return durations
 
 
+def _weekend_spans_relative_days(created: dt.datetime, resolved: dt.datetime) -> List[Tuple[float, float]]:
+    """Return weekend overlap spans as (start_day, end_day) offsets from created."""
+    if resolved <= created:
+        return []
+
+    spans: List[Tuple[float, float]] = []
+    day = created.date()
+    last_day = resolved.date()
+
+    while day <= last_day:
+        if day.weekday() >= 5:
+            day_start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+            day_end = day_start + dt.timedelta(days=1)
+            overlap_start = max(created, day_start)
+            overlap_end = min(resolved, day_end)
+            if overlap_end > overlap_start:
+                y0 = (overlap_start - created).total_seconds() / 86400.0
+                y1 = (overlap_end - created).total_seconds() / 86400.0
+                spans.append((max(0.0, y0), max(0.0, y1)))
+        day += dt.timedelta(days=1)
+
+    return spans
+
+
+def _weekday_spans_relative_days(
+    created: dt.datetime,
+    interval_start: dt.datetime,
+    interval_end: dt.datetime,
+) -> List[Tuple[float, float]]:
+    """Return weekday overlap spans as (start_day, end_day) offsets from created."""
+    if interval_end <= interval_start:
+        return []
+
+    spans: List[Tuple[float, float]] = []
+    day = interval_start.date()
+    last_day = interval_end.date()
+
+    while day <= last_day:
+        if day.weekday() < 5:
+            day_start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+            day_end = day_start + dt.timedelta(days=1)
+            overlap_start = max(interval_start, day_start)
+            overlap_end = min(interval_end, day_end)
+            if overlap_end > overlap_start:
+                y0 = (overlap_start - created).total_seconds() / 86400.0
+                y1 = (overlap_end - created).total_seconds() / 86400.0
+                spans.append((max(0.0, y0), max(0.0, y1)))
+        day += dt.timedelta(days=1)
+
+    return spans
+
+
 def jira_cycle_stats_in_window(
     tickets: List[Dict],
     window_start: dt.datetime,
@@ -904,6 +1163,399 @@ def _plot_flow_trend_group(ax, x, labels, lead_all, lead_filt, cycle_all, cycle_
     ax.legend(loc="upper left", ncol=2, fontsize=9)
 
 
+def generate_disaster_recovery_lead_time_chart(year: int, month: int, lookback_months: int = 6) -> str:
+    import matplotlib.pyplot as plt
+
+    policy = load_metric_groups_policy()
+    validity = policy.get("validity") if isinstance(policy.get("validity"), dict) else {}
+    all_tickets = all_jira_tickets()
+    tickets_by_key = {
+        str(ticket.get("key") or "").strip(): ticket
+        for ticket in all_tickets
+        if str(ticket.get("key") or "").strip()
+    }
+    dr_tickets = [
+        ticket for ticket in select_disaster_recovery_tickets(all_tickets)
+        if _is_positive_resolution(ticket)
+    ]
+
+    months = _month_sequence(year, month, lookback_months)
+    labels = [dt.date(y, m, 1).strftime("%b %Y") for y, m in months]
+    month_points: List[List[Dict[str, object]]] = []
+    outliers_excluded = 0
+    service_names: set = set()
+
+    for y, m in months:
+        window_start, window_end = _month_window(y, m)
+        pairs = jira_lead_durations_by_ticket_in_window(dr_tickets, window_start, window_end, validity)
+        filtered_pairs = filter_iqr_outlier_pairs(pairs)
+        outliers_excluded += max(0, len(pairs) - len(filtered_pairs))
+
+        points: List[Dict[str, object]] = []
+        for ticket, days in sorted(
+            filtered_pairs,
+            key=lambda item: (disaster_recovery_service_name(item[0], tickets_by_key).lower(), float(item[1])),
+        ):
+            service = disaster_recovery_service_name(ticket, tickets_by_key)
+            service_names.add(service)
+            points.append({"ticket": ticket, "lead_days": float(days), "service": service})
+        month_points.append(points)
+
+    palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#4c78a8", "#f58518", "#54a24b", "#b279a2", "#72b7b2",
+    ]
+    service_colors = {
+        service: palette[idx % len(palette)]
+        for idx, service in enumerate(sorted(service_names, key=lambda value: value.lower()))
+    }
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    out = os.path.join(REPORTS_DIR, f"jira_flow_trend_dr_individual_{year}_{month:02d}.png")
+    fig, ax = plt.subplots(figsize=(13, 5))
+    total_count = sum(len(points) for points in month_points)
+
+    if total_count:
+        xvals: List[float] = []
+        yvals: List[float] = []
+        colors: List[str] = []
+        widths: List[float] = []
+        month_tick_positions: List[float] = []
+        month_count_annotations: List[Tuple[float, int]] = []
+        month_boundaries: List[float] = []
+        cursor = 0.0
+        month_gap = 2.0
+        bar_width = 0.72
+
+        for month_idx, points in enumerate(month_points):
+            month_start = cursor
+            service_groups: Dict[str, List[Dict[str, object]]] = {}
+            for point in points:
+                service_groups.setdefault(str(point.get("service") or "Unmapped service"), []).append(point)
+
+            for service in sorted(service_groups, key=lambda value: value.lower()):
+                for point in service_groups[service]:
+                    xvals.append(cursor + (bar_width / 2.0))
+                    yvals.append(float(point.get("lead_days") or 0.0))
+                    colors.append(service_colors.get(service, "#4c78a8"))
+                    widths.append(bar_width)
+                    cursor += bar_width
+
+            if cursor > month_start:
+                month_tick_positions.append((month_start + cursor) / 2.0)
+                month_count_annotations.append(((month_start + cursor) / 2.0, len(points)))
+            else:
+                month_tick_positions.append(month_start)
+                month_count_annotations.append((month_start, 0))
+
+            month_boundaries.append(cursor)
+            if month_idx < len(month_points) - 1:
+                cursor += month_gap
+
+        ax.bar(xvals, yvals, width=widths, color=colors, alpha=0.88)
+
+        if len(xvals) >= 2:
+            x_mean = sum(xvals) / float(len(xvals))
+            y_mean = sum(yvals) / float(len(yvals))
+            numerator = sum((xv - x_mean) * (yv - y_mean) for xv, yv in zip(xvals, yvals))
+            denominator = sum((xv - x_mean) * (xv - x_mean) for xv in xvals)
+            if denominator > 0:
+                slope = numerator / denominator
+                intercept = y_mean - (slope * x_mean)
+                trend_x_start = min(xvals)
+                trend_x_end = max(xvals)
+                ax.plot(
+                    [trend_x_start, trend_x_end],
+                    [(slope * trend_x_start) + intercept, (slope * trend_x_end) + intercept],
+                    color="#6b7280",
+                    linewidth=1.2,
+                    linestyle=":",
+                    alpha=0.75,
+                    zorder=3,
+                )
+
+        for boundary in month_boundaries[:-1]:
+            ax.axvline(boundary + (month_gap / 2.0), color="#d8d8d8", linestyle=":", linewidth=0.8, zorder=0)
+
+        max_y = max(yvals) if yvals else 0.0
+        label_y = max(12.0, max_y * 1.12)
+        for month_x, ticket_count in month_count_annotations:
+            ax.annotate(
+                f"{ticket_count} tickets",
+                xy=(month_x, label_y),
+                xytext=(0, 2),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#444444",
+            )
+
+        ax.set_xlim(-0.8, (month_boundaries[-1] + 0.8) if month_boundaries else 0.8)
+        ax.set_ylim(bottom=0, top=max(12.0, label_y * 1.10))
+        ax.set_xticks(month_tick_positions)
+        ax.set_xticklabels(labels, rotation=0, ha="center")
+        ax.tick_params(axis="x", pad=8)
+
+        from matplotlib.patches import Patch
+
+        handles = [
+            Patch(facecolor=service_colors[service], label=service)
+            for service in sorted(service_colors, key=lambda value: value.lower())
+        ]
+        if handles:
+            ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7)
+    else:
+        ax.text(0.5, 0.5, "No DR tickets resolved in selected window", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+
+    ax.text(
+        0.01,
+        0.98,
+        f"Outliers excluded: {outliers_excluded}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        color="#666666",
+    )
+    ax.text(
+        0.99,
+        0.98,
+        f"{total_count} DR tickets",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        color="#444444",
+    )
+    ax.set_ylabel("Days")
+    ax.grid(axis="y", alpha=0.25, linestyle=":")
+    ax.set_title("Lead Time - Disaster Recovery Tickets", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+def _collect_vs_pr_timeline_entries(year: int, month: int) -> List[Dict[str, object]]:
+    """Collect PR ticket lifecycle timestamps for a full month timeline view."""
+    policy = load_metric_groups_policy()
+    groups = policy.get("groups") if isinstance(policy.get("groups"), list) else []
+    vertical_group = _find_metric_group(groups, "vertical_support", "Vertical Support")
+    if vertical_group is None:
+        return []
+
+    all_tickets = all_jira_tickets()
+    month_start = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
+    next_year = year + (1 if month == 12 else 0)
+    next_month = 1 if month == 12 else month + 1
+    month_end = dt.datetime(next_year, next_month, 1, tzinfo=dt.timezone.utc)
+
+    vs_tickets = [
+        t for t in select_group_tickets(all_tickets, vertical_group)
+        if _is_positive_resolution(t) and not _is_excluded_ecommerce_team(t)
+    ]
+    pr_tickets = [t for t in vs_tickets if _vs_issue_type_group(t) == "PR"]
+
+    entries: List[Dict[str, object]] = []
+    for ticket in pr_tickets:
+        fields = ticket_fields(ticket)
+        created = parse_jira_datetime(str(fields.get("created") or ""))
+        resolved = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+        if created is None or resolved is None:
+            continue
+
+        created_utc = created.astimezone(dt.timezone.utc)
+        resolved_utc = resolved.astimezone(dt.timezone.utc)
+        if resolved_utc < month_start or created_utc >= month_end:
+            continue
+
+        work_start: Optional[dt.datetime] = None
+        histories = ticket.get("changelog", {}).get("histories", [])
+        for history in sorted(histories, key=lambda item: item.get("created") or ""):
+            h_created = parse_jira_datetime(str(history.get("created") or ""))
+            if h_created is None:
+                continue
+            for change in history.get("items", []):
+                if change.get("field") == "status" and change.get("toString") in ("In Progress", "In Review"):
+                    h_utc = h_created.astimezone(dt.timezone.utc)
+                    if work_start is None or h_utc < work_start:
+                        work_start = h_utc
+
+        entries.append(
+            {
+                "key": str(ticket.get("key") or ""),
+                "created": created_utc,
+                "work_start": work_start,
+                "resolved": resolved_utc,
+                "size": _pr_size_bucket(ticket),
+                "priority": _priority_bucket(ticket),
+            }
+        )
+
+    entries.sort(key=lambda item: item["created"])
+    return entries
+
+
+def generate_vs_pr_state_stacked_area_chart(year: int, month: int) -> Optional[str]:
+    """Generate a compact stacked area lifecycle view for one full month."""
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    from matplotlib.lines import Line2D
+
+    entries = _collect_vs_pr_timeline_entries(year, month)
+    if not entries:
+        return None
+
+    chart_start = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
+    next_year = year + (1 if month == 12 else 0)
+    next_month = 1 if month == 12 else month + 1
+    chart_end = dt.datetime(next_year, next_month, 1, tzinfo=dt.timezone.utc)
+
+    def dt_to_day(value: dt.datetime) -> float:
+        return (value - chart_start).total_seconds() / 86400.0
+
+    # Sample every 2 hours to keep smooth curves while preserving daily shape.
+    sample_times: List[dt.datetime] = []
+    t = chart_start
+    while t <= chart_end:
+        sample_times.append(t)
+        t += dt.timedelta(hours=2)
+    sample_x = [dt_to_day(ti) for ti in sample_times]
+
+    size_colors = {
+        "XS": "#6baed6",
+        "S": "#4292c6",
+        "M": "#2171b5",
+        "L": "#08519c",
+        "XL": "#08306b",
+    }
+    waiting_counts: List[int] = []
+    in_progress_by_size: Dict[str, List[int]] = {s: [] for s in _PR_SIZE_ORDER}
+    total_open: List[int] = []
+
+    for ti in sample_times:
+        waiting = 0
+        progress = {s: 0 for s in _PR_SIZE_ORDER}
+        for entry in entries:
+            created = entry["created"]
+            resolved = entry["resolved"]
+            work_start = entry["work_start"] if entry["work_start"] else created
+            if not (created <= ti <= resolved):
+                continue
+            if ti < work_start:
+                waiting += 1
+            else:
+                size = str(entry.get("size") or "M")
+                progress[size] = progress.get(size, 0) + 1
+
+        waiting_counts.append(waiting)
+        for s in _PR_SIZE_ORDER:
+            in_progress_by_size[s].append(progress[s])
+        total_open.append(waiting + sum(progress.values()))
+
+    # Daily event counts.
+    day_starts: List[dt.datetime] = []
+    d = chart_start
+    while d < chart_end:
+        day_starts.append(d)
+        d += dt.timedelta(days=1)
+
+    created_daily = [0] * len(day_starts)
+    started_daily = [0] * len(day_starts)
+    resolved_daily = [0] * len(day_starts)
+
+    def day_index(value: dt.datetime) -> Optional[int]:
+        if value < chart_start or value >= chart_end:
+            return None
+        return int((value - chart_start).total_seconds() // 86400)
+
+    for entry in entries:
+        ci = day_index(entry["created"])
+        if ci is not None:
+            created_daily[ci] += 1
+
+        ws = entry["work_start"] if entry["work_start"] else entry["created"]
+        wi = day_index(ws)
+        if wi is not None:
+            started_daily[wi] += 1
+
+        ri = day_index(entry["resolved"])
+        if ri is not None:
+            resolved_daily[ri] += 1
+
+    fig, (ax_area, ax_evt) = plt.subplots(
+        2,
+        1,
+        figsize=(16, 8),
+        gridspec_kw={"height_ratios": [3.6, 1.5]},
+        sharex=True,
+    )
+    fig.subplots_adjust(hspace=0.08)
+
+    # Weekend shading.
+    for day in day_starts:
+        if day.weekday() >= 5:
+            x0 = dt_to_day(day)
+            x1 = dt_to_day(day + dt.timedelta(days=1))
+            ax_area.axvspan(x0, x1, color="#ececec", alpha=0.78, zorder=0)
+            ax_evt.axvspan(x0, x1, color="#ececec", alpha=0.78, zorder=0)
+
+    area_series = [in_progress_by_size[s] for s in _PR_SIZE_ORDER]
+    area_colors = [size_colors[s] for s in _PR_SIZE_ORDER]
+    ax_area.stackplot(sample_x, area_series, colors=area_colors, alpha=0.9, zorder=2)
+    ax_area.plot(sample_x, waiting_counts, color="#d73027", linewidth=1.9, linestyle="--", zorder=3)
+    ax_area.plot(sample_x, total_open, color="#2f2f2f", linewidth=1.4, alpha=0.85, zorder=3)
+
+    day_x = [dt_to_day(day) + 0.5 for day in day_starts]
+    bw = 0.22
+    ax_evt.bar([xv - bw for xv in day_x], created_daily, width=bw, color="#d24a43", alpha=0.88, zorder=2)
+    ax_evt.bar(day_x, started_daily, width=bw, color="#3b7fc4", alpha=0.88, zorder=2)
+    ax_evt.bar([xv + bw for xv in day_x], resolved_daily, width=bw, color="#43a047", alpha=0.88, zorder=2)
+
+    ax_area.set_ylabel("Concurrent PRs")
+    ax_area.grid(axis="y", alpha=0.25, linestyle=":")
+    ax_area.grid(axis="x", alpha=0.18, linestyle=":")
+    ax_area.yaxis.set_major_locator(mticker.MaxNLocator(integer=True, nbins=6))
+    ax_area.set_ylim(bottom=0)
+
+    ax_evt.set_ylabel("Daily\nEvents", fontsize=8)
+    ax_evt.yaxis.set_major_locator(mticker.MaxNLocator(integer=True, nbins=4))
+    ax_evt.grid(axis="y", alpha=0.25, linestyle=":")
+    ax_evt.grid(axis="x", alpha=0.18, linestyle=":")
+
+    xticks = [dt_to_day(day) for day in day_starts]
+    xlabels = [day.strftime("%-d\n%a") for day in day_starts]
+    ax_evt.set_xticks(xticks)
+    ax_evt.set_xticklabels(xlabels, fontsize=7)
+
+    month_name = dt.date(year, month, 1).strftime("%B %Y")
+    ax_area.set_title(f"PR Lifecycle State Area – {month_name}", fontsize=12, fontweight="bold")
+
+    legend_handles = [
+        Line2D([0], [0], color=size_colors[s], linewidth=7, label=f"In Progress {s}") for s in _PR_SIZE_ORDER
+    ] + [
+        Line2D([0], [0], color="#d73027", linestyle="--", linewidth=2, label="Waiting"),
+        Line2D([0], [0], color="#2f2f2f", linewidth=1.4, label="Total Open"),
+    ]
+    ax_area.legend(handles=legend_handles, loc="upper left", ncol=3, fontsize=7.5)
+
+    evt_legend = [
+        Line2D([0], [0], color="#d24a43", linewidth=6, label="Created"),
+        Line2D([0], [0], color="#3b7fc4", linewidth=6, label="Work started"),
+        Line2D([0], [0], color="#43a047", linewidth=6, label="Resolved"),
+    ]
+    ax_evt.legend(handles=evt_legend, loc="upper right", ncol=3, fontsize=8)
+
+    out_file = os.path.join(REPORTS_DIR, f"jira_vs_pr_state_area_{year}_{month:02d}.png")
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_file
+
+
 def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -> str:
     import matplotlib.pyplot as plt
     import matplotlib.image as mpimg
@@ -984,14 +1636,32 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
             vs_individual_outliers_excluded += max(0, len(lead_pairs) - len(filtered_pairs))
             vs_size_avg[size].append(_avg_or_none(lead_filtered))
             vs_size_counts[size].append(len(lead_filtered))
-            month_size_points[size] = [
-                {
-                    "lead_days": days,
-                    "priority": _priority_bucket(ticket),
-                    "priority_icon_url": _priority_icon_url(ticket),
-                }
-                for ticket, days in sorted(filtered_pairs, key=lambda item: float(item[1]))
-            ]
+            points: List[Dict[str, object]] = []
+            for ticket, days in sorted(filtered_pairs, key=lambda item: float(item[1])):
+                fields = ticket_fields(ticket)
+                created = parse_jira_datetime(str(fields.get("created") or ""))
+                resolution = parse_jira_datetime(str(fields.get("resolutiondate") or ""))
+                cycle_start = _first_in_progress_transition_at(ticket)
+                weekend_spans = (
+                    _weekend_spans_relative_days(created, resolution)
+                    if created is not None and resolution is not None
+                    else []
+                )
+                waiting_weekday_spans = (
+                    _weekday_spans_relative_days(created, created, cycle_start)
+                    if created is not None and cycle_start is not None and cycle_start > created
+                    else []
+                )
+                points.append(
+                    {
+                        "lead_days": days,
+                        "weekend_spans": weekend_spans,
+                        "waiting_weekday_spans": waiting_weekday_spans,
+                        "priority": _priority_bucket(ticket),
+                        "priority_icon_url": _priority_icon_url(ticket),
+                    }
+                )
+            month_size_points[size] = points
 
         vs_individual_by_month.append(month_size_points)
 
@@ -1048,6 +1718,8 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
     out_vs = os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_{year}_{month:02d}.png")
     out_vs_individual = os.path.join(REPORTS_DIR, f"jira_flow_trend_vs_individual_{year}_{month:02d}.png")
     out_ktlo = os.path.join(REPORTS_DIR, f"jira_flow_trend_ktlo_{year}_{month:02d}.png")
+    out_state_area = os.path.join(REPORTS_DIR, f"jira_vs_pr_state_area_{year}_{month:02d}.png")
+    out_dr_individual = os.path.join(REPORTS_DIR, f"jira_flow_trend_dr_individual_{year}_{month:02d}.png")
 
     # --- Vertical Support chart: average lead time bars by PR size ---
     fig_vs, ax_vs = plt.subplots(figsize=(13, 5))
@@ -1140,6 +1812,8 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
     if total_pr_count > 0:
         xpos: List[float] = []
         yvals: List[float] = []
+        weekend_spans_by_bar: List[List[Tuple[float, float]]] = []
+        waiting_weekday_spans_by_bar: List[List[Tuple[float, float]]] = []
         colors: List[str] = []
         priorities: List[str] = []
         priority_icon_urls: List[str] = []
@@ -1165,6 +1839,10 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
                     lead_days = float(point.get("lead_days") or 0.0)
                     xpos.append(cursor + (bar_w / 2.0))
                     yvals.append(lead_days)
+                    weekend_spans_by_bar.append(point.get("weekend_spans") if isinstance(point.get("weekend_spans"), list) else [])
+                    waiting_weekday_spans_by_bar.append(
+                        point.get("waiting_weekday_spans") if isinstance(point.get("waiting_weekday_spans"), list) else []
+                    )
                     colors.append(size_colors.get(size, "#4c78a8"))
                     priorities.append(str(point.get("priority") or ""))
                     priority_icon_urls.append(str(point.get("priority_icon_url") or ""))
@@ -1195,6 +1873,44 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
                 bar_widths.extend([w] * len(points))
 
         ax_vs_individual.bar(xpos, yvals, width=bar_widths, color=colors, alpha=0.88)
+
+        # Waiting overlay (top-down): draw total weekday waiting as a cap from the top
+        # so the untinted lower segment visually reads as cycle time.
+        for xv, bw, yv, spans in zip(xpos, bar_widths, yvals, waiting_weekday_spans_by_bar):
+            if not spans:
+                continue
+            waiting_total = sum(max(0.0, y1 - y0) for y0, y1 in spans)
+            cap_h = min(max(0.0, waiting_total), max(0.0, yv))
+            if cap_h <= 0.0:
+                continue
+            ax_vs_individual.bar(
+                xv,
+                cap_h,
+                width=bw,
+                bottom=max(0.0, yv - cap_h),
+                color="#0f172a",
+                alpha=0.10,
+                zorder=3,
+            )
+
+        # Weekend overlay: thin center stripe segments for weekend time within lead duration.
+        for xv, bw, spans in zip(xpos, bar_widths, weekend_spans_by_bar):
+            if not spans:
+                continue
+            stripe_w = max(0.06, bw * 0.18)
+            for y0, y1 in spans:
+                span_h = max(0.0, y1 - y0)
+                if span_h <= 0.0:
+                    continue
+                ax_vs_individual.bar(
+                    xv,
+                    span_h,
+                    width=stripe_w,
+                    bottom=y0,
+                    color="#0f172a",
+                    alpha=0.10,
+                    zorder=4,
+                )
 
         if len(xpos) >= 2:
             x_mean = sum(xpos) / float(len(xpos))
@@ -1413,7 +2129,15 @@ def generate_flow_trend_chart(year: int, month: int, lookback_months: int = 6) -
     fig_ktlo.savefig(out_ktlo, dpi=200, bbox_inches="tight")
     plt.close(fig_ktlo)
 
-    return f"{out_vs},{out_vs_individual},{out_ktlo}"
+    generated_state = generate_vs_pr_state_stacked_area_chart(year, month)
+    if generated_state and generated_state != out_state_area:
+        out_state_area = generated_state
+
+    generated_dr = generate_disaster_recovery_lead_time_chart(year, month, lookback_months=lookback_months)
+    if generated_dr:
+        out_dr_individual = generated_dr
+
+    return ",".join(path for path in [out_vs, out_vs_individual, out_ktlo, out_state_area, out_dr_individual] if path)
 
 
 def _has_visible_cells(mask) -> bool:

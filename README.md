@@ -132,6 +132,7 @@ Fetch only:
 ```bash
 python3 scripts/fetch-data.py github --month 2026-04
 python3 scripts/fetch-data.py jira --month 2026-04
+python3 scripts/fetch-data.py jira-backlog
 ```
 
 Generate only:
@@ -139,7 +140,26 @@ Generate only:
 ```bash
 python3 scripts/generate-charts.py --month 2026-04
 python3 scripts/generate-report.py --month 2026-04
+python3 scripts/generate-charts.py jira-backlog
 ```
+
+`python3 scripts/generate-charts.py --month YYYY-MM` now generates GitHub + Jira heatmaps/flow charts and refreshes `reports/jira_backlog_overview.png` as part of the standard chart workflow.
+
+Backlog capability (stand-alone):
+
+```bash
+python3 scripts/fetch-data.py jira-backlog
+python3 scripts/fetch-data.py jira-backlog --backfill-months 6
+python3 scripts/generate-charts.py jira-backlog
+```
+
+Notes:
+
+- Policy config is in `config/jira-backlog.json`.
+- Snapshot cache is in `cache/jira/backlog/snapshots/` with manifest at `cache/jira/backlog/manifest.json`.
+- Current visualization is `reports/jira_backlog_overview.png` (KTLO stacked backlog trend with monthly Closed band).
+- Historical backfill points are derived from canonical Jira cache as month-end totals.
+- Backlog trend stacked areas are derived retrospectively from `cache/jira/by-created` and can be tuned with `chart.trend_months`.
 
 Clean generated data:
 
